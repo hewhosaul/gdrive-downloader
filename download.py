@@ -3,13 +3,14 @@
 GDrive Downloader — GitHub Actions
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Download waterfall:
-  1. aria2c         — 16 parallel connections, fastest for open servers
-  2. yt-dlp         — with curl_cffi impersonation, bypasses Cloudflare
-  3. curl_cffi      — browser TLS fingerprint, bypasses Cloudflare
-  4. requests       — plain fallback
+  1. aria2c     — 16 connections, 1MB splits (no tail slowdown)
+  2. yt-dlp     — curl_cffi impersonation, bypasses Cloudflare
+  3. curl_cffi  — browser TLS fingerprint
+  4. requests   — plain fallback
 
-Upload: OAuth refresh token → your personal GDrive quota (no limit issues)
-        256MB RAM chunks → resumable Drive API (works for 100GB+ files)
+Upload: OAuth → your personal GDrive quota
+        512MB RAM chunks → resumable Drive API (any file size)
+        Folder: hardcoded to your existing Movies folder
 """
 
 import os, sys, re, time, json, subprocess, tempfile
@@ -25,11 +26,13 @@ from googleapiclient.discovery import build
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
-GDRIVE_FOLDER = 'Movies'
-CHUNK_SIZE    = 256 * 1024 * 1024   # 256MB upload chunks (RAM only, no disk)
-DL_CHUNK      = 8   * 1024 * 1024   # 8MB read buffer
-ARIA2C_CONNS  = 16
-TMP           = tempfile.mkdtemp(prefix='dl_')
+# Your existing shared Movies folder — never creates a new one
+GDRIVE_FOLDER_ID = '1TRND8VlWi0U7wdHk3HLJ7hvzOw90PDE3'
+
+CHUNK_SIZE   = 512 * 1024 * 1024   # 512MB upload chunks — fewer round trips = faster sustained
+DL_CHUNK     = 8   * 1024 * 1024   # 8MB read buffer
+ARIA2C_CONNS = 16
+TMP          = tempfile.mkdtemp(prefix='dl_')
 
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
       'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -48,27 +51,28 @@ COMMON_HEADERS = {
 def log(msg): print(msg, flush=True)
 def hr():     log('─' * 65)
 def fmt(b):   return f'{b/1e9:.2f} GB' if b > 1e9 else f'{b/1e6:.1f} MB'
-def speed(b): return f'{b/1e6:.1f} MB/s'
+def spd(b):   return f'{b/1e6:.1f} MB/s'
 
 def sanitize(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
     return name[:200].strip() or f'file_{int(time.time())}'
 
-def referer(url): 
+def referer(url):
     p = urlparse(url)
     return f'{p.scheme}://{p.netloc}/'
 
 def make_session():
     s = req_lib.Session()
     s.headers.update(COMMON_HEADERS)
-    s.mount('http://',  req_lib.adapters.HTTPAdapter(max_retries=req_lib.adapters.Retry(3, backoff_factor=1)))
-    s.mount('https://', req_lib.adapters.HTTPAdapter(max_retries=req_lib.adapters.Retry(3, backoff_factor=1)))
+    retry = req_lib.adapters.Retry(3, backoff_factor=1)
+    s.mount('http://',  req_lib.adapters.HTTPAdapter(max_retries=retry))
+    s.mount('https://', req_lib.adapters.HTTPAdapter(max_retries=retry))
     return s
 
 SESSION = make_session()
 
 # ═══════════════════════════════════════════════════════════════
-# OAUTH — uses your personal GDrive quota, no service account
+# OAUTH
 # ═══════════════════════════════════════════════════════════════
 _creds = None
 
@@ -78,52 +82,36 @@ def get_creds() -> Credentials:
         if _creds.expired:
             _creds.refresh(GoogleAuthRequest())
         return _creds
-
-    client_id     = os.environ['GDRIVE_CLIENT_ID']
-    client_secret = os.environ['GDRIVE_CLIENT_SECRET']
-    refresh_token = os.environ['GDRIVE_REFRESH_TOKEN']
-
     _creds = Credentials(
         token=None,
-        refresh_token=refresh_token,
+        refresh_token=os.environ['GDRIVE_REFRESH_TOKEN'],
         token_uri='https://oauth2.googleapis.com/token',
-        client_id=client_id,
-        client_secret=client_secret,
-        scopes=['https://www.googleapis.com/auth/drive.file'],
+        client_id=os.environ['GDRIVE_CLIENT_ID'],
+        client_secret=os.environ['GDRIVE_CLIENT_SECRET'],
+        scopes=['https://www.googleapis.com/auth/drive'],
     )
     _creds.refresh(GoogleAuthRequest())
     return _creds
 
 def get_token() -> str:
-    creds = get_creds()
-    if creds.expired:
-        creds.refresh(GoogleAuthRequest())
-    return creds.token
+    c = get_creds()
+    if c.expired:
+        c.refresh(GoogleAuthRequest())
+    return c.token
 
 def get_drive():
     return build('drive', 'v3', credentials=get_creds(), cache_discovery=False)
 
 # ═══════════════════════════════════════════════════════════════
-# DRIVE FOLDER
+# DRIVE HELPERS
 # ═══════════════════════════════════════════════════════════════
-def get_or_create_folder(drive, name, parent='root') -> str:
-    q = (f"name='{name}' and "
-         f"mimeType='application/vnd.google-apps.folder' and "
-         f"'{parent}' in parents and trashed=false")
-    res = drive.files().list(q=q, fields='files(id)').execute()
-    if res['files']:
-        return res['files'][0]['id']
-    f = drive.files().create(
-        body={'name': name,
-              'mimeType': 'application/vnd.google-apps.folder',
-              'parents': [parent]},
-        fields='id').execute()
-    log(f'  Created GDrive folder "{name}"')
-    return f['id']
-
 def file_exists(drive, folder_id, fname, expected_size) -> bool:
+    # Search in folder and all parents (handles shared drives too)
     q = f"name='{fname}' and '{folder_id}' in parents and trashed=false"
-    res = drive.files().list(q=q, fields='files(id,size)').execute()
+    res = drive.files().list(
+        q=q, fields='files(id,size)',
+        supportsAllDrives=True, includeItemsFromAllDrives=True
+    ).execute()
     if not res['files']:
         return False
     ds = int(res['files'][0].get('size', 0))
@@ -159,13 +147,12 @@ def resolve_url(url: str):
     size  = int(r.headers.get('Content-Length', 0)) if r else 0
 
     log(f'  File : {fname}')
-    log(f'  Size : {fmt(size) if size else "unknown (server did not send Content-Length)"}')
+    log(f'  Size : {fmt(size) if size else "unknown"}')
     log(f'  URL  : {final[:100]}')
     return final, fname, size
 
 # ═══════════════════════════════════════════════════════════════
-# STREAMING UPLOAD — 256MB RAM chunks → Drive API resumable
-# No disk writes. Works for files of any size.
+# STREAMING UPLOAD — 512MB RAM chunks → Drive API resumable
 # ═══════════════════════════════════════════════════════════════
 class StreamUploader:
     def __init__(self, folder_id, fname, total_size):
@@ -178,7 +165,8 @@ class StreamUploader:
         token = get_token()
         meta  = json.dumps({'name': self.fname, 'parents': [self.folder_id]})
         r = req_lib.post(
-            'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable',
+            'https://www.googleapis.com/upload/drive/v3/files'
+            '?uploadType=resumable&supportsAllDrives=true',
             headers={
                 'Authorization': f'Bearer {token}',
                 'Content-Type': 'application/json; charset=UTF-8',
@@ -212,6 +200,7 @@ class StreamUploader:
                 wait = 2 ** attempt
                 log(f'  Upload retry {attempt+1}/6 in {wait}s: {e}')
                 time.sleep(wait)
+                token = get_token()
 
     def run(self, stream_iter, bar_desc='Upload'):
         self._start()
@@ -227,19 +216,19 @@ class StreamUploader:
                 piece = buf[:CHUNK_SIZE]; buf = buf[CHUNK_SIZE:]
                 self._put_chunk(piece, uploaded, is_last=False)
                 uploaded += len(piece); bar.update(len(piece))
-                elapsed = time.time() - t0
-                if elapsed: bar.set_postfix(speed=speed(uploaded/elapsed), refresh=True)
+                e = time.time() - t0
+                if e: bar.set_postfix(speed=spd(uploaded/e), refresh=True)
         if buf:
             if not self.total_size:
                 self.total_size = uploaded + len(buf)
             self._put_chunk(buf, uploaded, is_last=True)
             uploaded += len(buf); bar.update(len(buf))
         bar.close()
-        elapsed = time.time() - t0
-        log(f'  Uploaded {fmt(uploaded)} in {elapsed:.1f}s ({speed(uploaded/elapsed)})')
+        e = time.time() - t0
+        log(f'  Uploaded {fmt(uploaded)} in {e:.1f}s ({spd(uploaded/e)})')
         return uploaded
 
-def file_to_drive(path, uploader, desc='Cloud -> GDrive'):
+def file_to_drive(path, uploader, desc='GDrive'):
     def gen():
         with open(path, 'rb') as f:
             while True:
@@ -249,7 +238,7 @@ def file_to_drive(path, uploader, desc='Cloud -> GDrive'):
     uploader.run(gen(), bar_desc=desc)
 
 # ═══════════════════════════════════════════════════════════════
-# PROGRESS BAR — poll growing file while subprocess runs
+# PROGRESS BAR POLLER
 # ═══════════════════════════════════════════════════════════════
 def poll_bar(proc, out_path, size, desc):
     bar = tqdm(total=size or None, unit='B', unit_scale=True,
@@ -262,23 +251,28 @@ def poll_bar(proc, out_path, size, desc):
         if cur > prev:
             bar.update(cur - prev)
             e = time.time() - t0
-            if e: bar.set_postfix(speed=speed(cur/e), refresh=True)
+            if e: bar.set_postfix(speed=spd(cur/e), refresh=True)
             prev = cur
-        time.sleep(0.4)
+        time.sleep(0.3)  # poll faster for better bar resolution
     try:
         cur = os.path.getsize(out_path); bar.update(cur - prev)
     except OSError: pass
     bar.close()
 
 # ═══════════════════════════════════════════════════════════════
-# METHOD 1 — aria2c (fastest for open/CDN servers)
+# METHOD 1 — aria2c
+# KEY FIX: -k1M + --min-split-size=1M keeps all 16 connections
+#           busy right to the last MB, no tail slowdown
 # ═══════════════════════════════════════════════════════════════
 def try_aria2c(url, fname, size, uploader) -> bool:
-    log('  [1/4] aria2c — 16 parallel connections')
+    log('  [1/4] aria2c — 16 connections, 1MB splits (no tail slowdown)')
     out = f'{TMP}/{fname}'
     cmd = [
         'aria2c', url, '--dir', TMP, '--out', fname,
-        f'-x{ARIA2C_CONNS}', f'-s{ARIA2C_CONNS}', '-k4M',
+        f'-x{ARIA2C_CONNS}',
+        f'-s{ARIA2C_CONNS}',
+        '-k1M',                    # ← 1MB min split keeps all 16 busy to the end
+        '--min-split-size=1M',     # ← enforce minimum split
         '--max-tries=5', '--retry-wait=3',
         '--connect-timeout=20', '--timeout=120',
         '--continue=true', '--auto-file-renaming=false',
@@ -305,7 +299,7 @@ def try_aria2c(url, fname, size, uploader) -> bool:
     return True
 
 # ═══════════════════════════════════════════════════════════════
-# METHOD 2 — yt-dlp with curl_cffi impersonation (Cloudflare bypass)
+# METHOD 2 — yt-dlp + curl_cffi (Cloudflare bypass)
 # ═══════════════════════════════════════════════════════════════
 def try_ytdlp(url, fname, size, uploader) -> bool:
     log('  [2/4] yt-dlp + curl_cffi (Cloudflare impersonation)')
@@ -321,7 +315,7 @@ def try_ytdlp(url, fname, size, uploader) -> bool:
         '--retries', '5', '--fragment-retries', '5',
         '--concurrent-fragments', '16',
         '--no-check-certificate',
-        '--extractor-args', 'generic:impersonate',   # ← Cloudflare bypass
+        '--extractor-args', 'generic:impersonate',
         '--progress', '--newline',
         url
     ]
@@ -343,7 +337,7 @@ def try_ytdlp(url, fname, size, uploader) -> bool:
             if cur > prev:
                 bar.update(cur - prev)
                 e = time.time() - t0
-                if e: bar.set_postfix(speed=speed(cur/e), refresh=True)
+                if e: bar.set_postfix(speed=spd(cur/e), refresh=True)
                 prev = cur
         elif line and '[download]' not in line:
             log(f'    {line}')
@@ -362,7 +356,7 @@ def try_ytdlp(url, fname, size, uploader) -> bool:
     return True
 
 # ═══════════════════════════════════════════════════════════════
-# METHOD 3 — curl_cffi (browser TLS fingerprint, Cloudflare bypass)
+# METHOD 3 — curl_cffi stream
 # ═══════════════════════════════════════════════════════════════
 def try_curl_cffi(url, fname, size, uploader) -> bool:
     log('  [3/4] curl_cffi (browser TLS fingerprint)')
@@ -380,28 +374,26 @@ def try_curl_cffi(url, fname, size, uploader) -> bool:
                 colour='yellow', dynamic_ncols=True,
                 miniters=1, file=sys.stdout)
     try:
-        # impersonate='chrome120' makes TLS handshake look like real Chrome
-        with cffi_req.get(url, stream=True, timeout=120,
-                          impersonate='chrome120',
-                          headers=COMMON_HEADERS) as r:
-            r.raise_for_status()
-            with open(part, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=DL_CHUNK):
-                    if chunk:
-                        f.write(chunk); done += len(chunk); bar.update(len(chunk))
-                        e = time.time() - t0
-                        if e: bar.set_postfix(speed=speed(done/e), refresh=True)
+        r = cffi_req.get(url, stream=True, timeout=120,
+                         impersonate='chrome120',
+                         headers=COMMON_HEADERS)
+        r.raise_for_status()
+        with open(part, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=DL_CHUNK):
+                if chunk:
+                    f.write(chunk); done += len(chunk); bar.update(len(chunk))
+                    e = time.time() - t0
+                    if e: bar.set_postfix(speed=spd(done/e), refresh=True)
         bar.close()
         os.rename(part, out)
     except Exception as e:
         bar.close()
-        log(f'  curl_cffi download failed: {e}')
+        log(f'  curl_cffi failed: {e}')
         return False
 
     if not os.path.exists(out) or os.path.getsize(out) < 10000:
         log('  curl_cffi produced empty file')
         return False
-
     log(f'  curl_cffi done: {fmt(os.path.getsize(out))}')
     log('  Uploading to GDrive...')
     file_to_drive(out, uploader, desc=f'GDrive  {fname[:35]}')
@@ -410,7 +402,7 @@ def try_curl_cffi(url, fname, size, uploader) -> bool:
     return True
 
 # ═══════════════════════════════════════════════════════════════
-# METHOD 4 — plain requests stream (last resort)
+# METHOD 4 — requests stream (last resort)
 # ═══════════════════════════════════════════════════════════════
 def try_requests(url, fname, size, uploader) -> bool:
     log('  [4/4] requests stream (plain fallback)')
@@ -427,7 +419,7 @@ def try_requests(url, fname, size, uploader) -> bool:
                 if chunk:
                     done += len(chunk); bar.update(len(chunk))
                     e = time.time() - t0
-                    if e: bar.set_postfix(speed=speed(done/e), refresh=True)
+                    if e: bar.set_postfix(speed=spd(done/e), refresh=True)
                     yield chunk
         bar.close()
     try:
@@ -453,9 +445,8 @@ def process(url: str, drive, folder_id: str):
             log('  Already on GDrive — skipping')
             return
         uploader = StreamUploader(folder_id, fname, size)
-        t0       = time.time()
+        t0 = time.time()
         for fn in [try_aria2c, try_ytdlp, try_curl_cffi, try_requests]:
-            # clean any partial file before each attempt
             for p in Path(TMP).glob(f'{Path(fname).stem}*'):
                 try: p.unlink()
                 except: pass
@@ -474,7 +465,7 @@ def process(url: str, drive, folder_id: str):
 # MAIN
 # ═══════════════════════════════════════════════════════════════
 def main():
-    raw  = os.environ.get('DOWNLOAD_URLS', '').strip()
+    raw = os.environ.get('DOWNLOAD_URLS', '').strip()
     if not raw:
         log('No URLs. Set DOWNLOAD_URLS env var.')
         sys.exit(1)
@@ -486,27 +477,26 @@ def main():
 
     log('=' * 65)
     log(f'GDrive Downloader — {len(urls)} file(s) queued')
-    log(f'Destination : GDrive/{GDRIVE_FOLDER}')
-    log(f'Upload mode : OAuth (your personal quota)')
+    log(f'Destination : GDrive folder ID {GDRIVE_FOLDER_ID}')
+    log(f'Upload mode : OAuth (personal quota)')
+    log(f'Upload chunk: 512MB (faster sustained speed)')
+    log(f'aria2c split: 1MB (no tail slowdown)')
     log(f'Disk usage  : ~0 bytes (RAM streaming)')
     log('=' * 65)
 
-    # Validate OAuth secrets up front so we fail fast
     for key in ('GDRIVE_CLIENT_ID', 'GDRIVE_CLIENT_SECRET', 'GDRIVE_REFRESH_TOKEN'):
         if not os.environ.get(key):
             log(f'ERROR: GitHub secret "{key}" is not set.')
-            log('Run get_token.py on your PC and add the three secrets.')
             sys.exit(1)
 
     log('Connecting to Google Drive...')
-    drive     = get_drive()
-    folder_id = get_or_create_folder(drive, GDRIVE_FOLDER)
-    log(f'GDrive ready — uploading to personal quota\n')
+    drive = get_drive()
+    log(f'GDrive ready\n')
 
     t0 = time.time()
     for i, url in enumerate(urls, 1):
         log(f'\n[{i}/{len(urls)}]')
-        process(url, drive, folder_id)
+        process(url, drive, GDRIVE_FOLDER_ID)
     hr()
     log(f'All done in {(time.time()-t0)/60:.1f} min')
 
