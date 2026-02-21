@@ -423,6 +423,82 @@ class StreamUploader:
         log(f'  ↳ GDrive  | done | {fmt(uploaded)} | avg {spd(uploaded/e)}')
         return uploaded
 
+
+# ══════════════════════════════════════════════════════════════
+# METHOD 1b — gofile via yt-dlp URL extraction + aria2c download
+# yt-dlp resolves the real direct URL + token, aria2c downloads
+# at 16 connections for full speed instead of yt-dlp's single thread
+# ══════════════════════════════════════════════════════════════
+def try_gofile_fast(url, fname, size, uploader) -> bool:
+    log('  [1/5] gofile fast — yt-dlp extract URL + aria2c 16 connections')
+
+    # Step 1: use yt-dlp to extract the real direct URL + cookies
+    extract_cmd = [
+        'yt-dlp', '--no-playlist', '--no-warnings',
+        '--get-url',           # just print the download URL, don't download
+        '--user-agent', UA,
+        '--no-check-certificate',
+        url
+    ]
+    try:
+        r = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=60)
+        direct_url = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ''
+        if not direct_url or not direct_url.startswith('http'):
+            log(f'  yt-dlp URL extraction failed: {r.stderr[:200]}')
+            return False
+        log(f'  Extracted URL: {direct_url[:80]}')
+    except Exception as e:
+        log(f'  URL extraction error: {e}')
+        return False
+
+    # Step 2: also extract cookies yt-dlp used
+    cookie_cmd = [
+        'yt-dlp', '--no-playlist', '--no-warnings',
+        '--cookies', f'{TMP}/gofile_cookies.txt',
+        '--skip-download',     # don't download, just save cookies
+        '--user-agent', UA,
+        url
+    ]
+    subprocess.run(cookie_cmd, capture_output=True, timeout=60)
+
+    # Step 3: aria2c with 16 connections on the real URL
+    out = f'{TMP}/{fname}'
+    cmd = [
+        'aria2c', direct_url,
+        '--dir', TMP, '--out', fname,
+        f'-x{ARIA2C_CONNS}', f'-s{ARIA2C_CONNS}',
+        '-k1M', '--min-split-size=1M',
+        '--max-tries=5', '--retry-wait=3',
+        '--connect-timeout=20', '--timeout=180',
+        '--continue=true', '--auto-file-renaming=false',
+        '--file-allocation=none', '--allow-overwrite=true',
+        '--console-log-level=error', '--summary-interval=0',
+        f'--user-agent={UA}',
+        '--header=Accept: */*',
+        '--header=Accept-Encoding: identity',
+        '--header=Referer: https://gofile.io/',
+        '--header=Origin: https://gofile.io',
+    ]
+    # Add cookies file if it was created
+    cookies_path = f'{TMP}/gofile_cookies.txt'
+    if os.path.exists(cookies_path):
+        cmd += ['--load-cookies', cookies_path]
+
+    mon  = ProgressMonitor(out, size, f'gofile  {fname[:40]}').start()
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    proc.wait()
+    mon.stop()
+    stderr = proc.stderr.read().decode(errors='ignore').strip()
+    if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 1024*1024:
+        if stderr: log(f'  aria2c error: {stderr[-300:]}')
+        log('  gofile fast failed — falling back to yt-dlp single thread')
+        return False
+    log(f'  gofile fast done: {fmt(os.path.getsize(out))}')
+    uploader.upload_file(out)
+    try: os.remove(out)
+    except: pass
+    return True
+
 # ══════════════════════════════════════════════════════════════
 # METHOD 1 — aria2c HTTP/HTTPS
 # ══════════════════════════════════════════════════════════════
@@ -684,7 +760,14 @@ def process(url: str, drive, folder_id: str):
 
         uploader = StreamUploader(folder_id, fname, size)
         t0       = time.time()
-        methods  = [try_magnet] if magnet else [try_aria2c, try_ytdlp, try_curl_cffi, try_requests]
+        if magnet:
+            methods = [try_magnet]
+        elif gofile:
+            # gofile fast: yt-dlp extracts real URL, aria2c downloads at 16x speed
+            # falls back to yt-dlp single thread if aria2c fails
+            methods = [try_gofile_fast, try_ytdlp, try_curl_cffi, try_requests]
+        else:
+            methods = [try_aria2c, try_ytdlp, try_curl_cffi, try_requests]
 
         for fn in methods:
             stem = Path(fname).stem
