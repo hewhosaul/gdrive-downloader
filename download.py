@@ -182,60 +182,94 @@ def resolve_url(url: str):
 # ══════════════════════════════════════════════════════════════
 def resolve_gofile(url: str):
     """
-    gofile.io needs a guest token to download.
-    1. Fetch guest token from gofile API
-    2. Extract file ID from URL
-    3. Get download link + filename from gofile API
-    4. Return direct download URL with token header
+    gofile.io download flow (updated for current API):
+    1. Create guest account -> get token
+    2. Extract content ID from URL
+    3. Try multiple API endpoints (gofile changes them frequently)
+    4. Fall back to direct download with auth headers if API fails
     """
     log('  gofile.io detected — fetching guest token...')
 
-    # Get guest token
-    r = SESSION.post('https://api.gofile.io/accounts', timeout=15)
+    # Step 1: guest account token
+    r = SESSION.post('https://api.gofile.io/accounts',
+                     headers={'Content-Type': 'application/json'},
+                     timeout=15)
     r.raise_for_status()
-    data  = r.json()
-    token = data['data']['token']
-    log(f'  Got token: {token[:8]}...')
+    token = r.json()['data']['token']
+    log(f'  Token: {token[:10]}...')
 
-    # Extract content ID from URL
-    # Formats: /d/CONTENT_ID  or  /download/web/CONTENT_ID/filename
+    # Step 2: extract content ID
     m = re.search(r'/(?:d|download/web)/([a-f0-9-]{36})', url)
     if not m:
-        raise ValueError(f'Cannot extract gofile content ID from: {url}')
-    content_id = m.group(1)
-    log(f'  Content ID: {content_id}')
+        raise ValueError(f'Cannot parse gofile content ID from: {url}')
+    cid = m.group(1)
+    log(f'  Content ID: {cid}')
 
-    # Get file info
-    r2 = SESSION.get(
-        f'https://api.gofile.io/contents/{content_id}?wt=4fd6sg89d7s6',
-        headers={'Authorization': f'Bearer {token}'},
-        timeout=15)
-    r2.raise_for_status()
-    info = r2.json()
+    auth_headers = {
+        'Authorization': f'Bearer {token}',
+        'Cookie':        f'accountToken={token}',
+        'Referer':       'https://gofile.io/',
+        'Origin':        'https://gofile.io',
+    }
 
-    if info.get('status') != 'ok':
-        raise ValueError(f'gofile API error: {info}')
+    # Step 3: try API endpoints (gofile changes wt token periodically)
+    info = None
+    api_attempts = [
+        f'https://api.gofile.io/contents/{cid}',
+        f'https://api.gofile.io/contents/{cid}?wt=4fd6sg89d7s6',
+        f'https://api.gofile.io/contents/{cid}?wt=7fd94ds12fds4',
+        f'https://api.gofile.io/getContent?contentId={cid}&token={token}',
+    ]
+    for api_url in api_attempts:
+        try:
+            r2 = SESSION.get(api_url, headers=auth_headers, timeout=15)
+            if r2.status_code == 200:
+                data = r2.json()
+                if data.get('status') == 'ok':
+                    info = data['data']
+                    log(f'  API OK: {api_url[:60]}')
+                    break
+            log(f'  API {r2.status_code}: {api_url[:60]}')
+        except Exception as e:
+            log(f'  API error: {e}')
 
-    contents = info['data']['children']
-    files    = [v for v in contents.values() if v.get('type') == 'file']
-    if not files:
-        raise ValueError('No files found in gofile content')
+    # Step 4: API worked — parse file list
+    if info:
+        children = info.get('children', info.get('contents', {}))
+        if isinstance(children, dict):
+            files = [v for v in children.values()
+                     if isinstance(v, dict) and v.get('type') == 'file']
+        else:
+            files = []
 
-    # Pick largest file (or first if only one)
-    f     = max(files, key=lambda x: x.get('size', 0))
-    fname = sanitize(f['name'])
-    size  = f.get('size', 0)
-    dl    = f['link']
+        # Maybe the content itself is a file
+        if not files and info.get('type') == 'file':
+            files = [info]
 
+        if files:
+            f     = max(files, key=lambda x: x.get('size', 0))
+            fname = sanitize(f.get('name', f'gofile_{cid[:8]}.mkv'))
+            size  = f.get('size', 0)
+            dl    = f.get('link', f.get('directLink', url))
+            log(f'  File : {fname}')
+            log(f'  Size : {fmt(size) if size else "unknown"}')
+            SESSION.headers.update(auth_headers)
+            return dl, fname, size, token
+
+    # Step 5: API failed entirely — download directly with auth headers
+    # The URL itself is a direct link, just needs the right cookies
+    log('  API unavailable — attempting direct download with auth headers')
+    path  = unquote(urlparse(url).path)
+    fname = sanitize(Path(path).name or f'gofile_{cid[:8]}.mkv')
+    SESSION.headers.update(auth_headers)
+    try:
+        r3   = SESSION.head(url, allow_redirects=True, timeout=20)
+        size = int(r3.headers.get('Content-Length', 0))
+    except Exception:
+        size = 0
     log(f'  File : {fname}')
-    log(f'  Size : {fmt(size) if size else unknown}')
-    log(f'  Link : {dl[:80]}')
-
-    # Inject token into session for download
-    SESSION.headers['Cookie'] = f'accountToken={token}'
-    SESSION.headers['Authorization'] = f'Bearer {token}'
-
-    return dl, fname, size, token
+    log(f'  Size : {fmt(size) if size else "unknown"}')
+    return url, fname, size, token
 
 def resolve_magnet(url: str) -> str:
     m = re.search(r'[?&]dn=([^&]+)', url)
