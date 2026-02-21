@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'URLs to download (comma or newline separated)'
+        description: 'URLs or magnet links (comma or newline separated)'
         required: true
         type: string
 
@@ -12,6 +12,8 @@ jobs:
   download:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      PYTHONUNBUFFERED: "1"    # live logs fix — flush Python output immediately
 
     steps:
       - name: Checkout
@@ -27,7 +29,6 @@ jobs:
             google-api-python-client \
             google-auth-oauthlib \
             google-auth \
-            tqdm \
             requests
 
       - name: Run downloader
@@ -36,4 +37,4 @@ jobs:
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
           DOWNLOAD_URLS:        ${{ inputs.urls }}
-        run: python download.py
+        run: python -u download.py
