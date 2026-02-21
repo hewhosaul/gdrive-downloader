@@ -175,6 +175,68 @@ def resolve_url(url: str):
     log(f'  Size : {fmt(size) if size else "unknown"}')
     return final, fname, size
 
+
+# ══════════════════════════════════════════════════════════════
+# GOFILE.IO HANDLER — auto-fetches guest token + direct URL
+# gofile requires a token cookie, raw URLs return empty files
+# ══════════════════════════════════════════════════════════════
+def resolve_gofile(url: str):
+    """
+    gofile.io needs a guest token to download.
+    1. Fetch guest token from gofile API
+    2. Extract file ID from URL
+    3. Get download link + filename from gofile API
+    4. Return direct download URL with token header
+    """
+    log('  gofile.io detected — fetching guest token...')
+
+    # Get guest token
+    r = SESSION.post('https://api.gofile.io/accounts', timeout=15)
+    r.raise_for_status()
+    data  = r.json()
+    token = data['data']['token']
+    log(f'  Got token: {token[:8]}...')
+
+    # Extract content ID from URL
+    # Formats: /d/CONTENT_ID  or  /download/web/CONTENT_ID/filename
+    m = re.search(r'/(?:d|download/web)/([a-f0-9-]{36})', url)
+    if not m:
+        raise ValueError(f'Cannot extract gofile content ID from: {url}')
+    content_id = m.group(1)
+    log(f'  Content ID: {content_id}')
+
+    # Get file info
+    r2 = SESSION.get(
+        f'https://api.gofile.io/contents/{content_id}?wt=4fd6sg89d7s6',
+        headers={'Authorization': f'Bearer {token}'},
+        timeout=15)
+    r2.raise_for_status()
+    info = r2.json()
+
+    if info.get('status') != 'ok':
+        raise ValueError(f'gofile API error: {info}')
+
+    contents = info['data']['children']
+    files    = [v for v in contents.values() if v.get('type') == 'file']
+    if not files:
+        raise ValueError('No files found in gofile content')
+
+    # Pick largest file (or first if only one)
+    f     = max(files, key=lambda x: x.get('size', 0))
+    fname = sanitize(f['name'])
+    size  = f.get('size', 0)
+    dl    = f['link']
+
+    log(f'  File : {fname}')
+    log(f'  Size : {fmt(size) if size else unknown}')
+    log(f'  Link : {dl[:80]}')
+
+    # Inject token into session for download
+    SESSION.headers['Cookie'] = f'accountToken={token}'
+    SESSION.headers['Authorization'] = f'Bearer {token}'
+
+    return dl, fname, size, token
+
 def resolve_magnet(url: str) -> str:
     m = re.search(r'[?&]dn=([^&]+)', url)
     fname = sanitize(unquote(m.group(1).replace('+', ' '))) if m else f'torrent_{int(time.time())}'
@@ -353,8 +415,9 @@ def try_aria2c(url, fname, size, uploader) -> bool:
     proc.wait()
     mon.stop()
     stderr = proc.stderr.read().decode(errors='ignore').strip()
-    if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 1024:
+    if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 1024*1024:
         if stderr: log(f'  aria2c error: {stderr[-400:]}')
+        log(f'  aria2c: file too small ({fmt(os.path.getsize(out) if os.path.exists(out) else 0)}) — likely auth required or empty response')
         return False
     log(f'  aria2c done: {fmt(os.path.getsize(out))}')
     uploader.upload_file(out)
@@ -473,8 +536,8 @@ def try_ytdlp(url, fname, size, uploader) -> bool:
 
     candidates = sorted(Path(TMP).glob(f'{stem}.*'),
                         key=lambda p: p.stat().st_size, reverse=True)
-    if not candidates or candidates[0].stat().st_size < 1024:
-        log(f'  yt-dlp failed (code {proc.returncode})')
+    if not candidates or candidates[0].stat().st_size < 1024*1024:
+        log(f'  yt-dlp failed (code {proc.returncode}) — empty or too small')
         return False
     out = str(candidates[0])
     log(f'  yt-dlp done: {fmt(os.path.getsize(out))}')
@@ -518,8 +581,8 @@ def try_curl_cffi(url, fname, size, uploader) -> bool:
         except: pass
         return False
 
-    if not os.path.exists(out) or os.path.getsize(out) < 1024:
-        log('  curl_cffi: empty file')
+    if not os.path.exists(out) or os.path.getsize(out) < 1024*1024:
+        log('  curl_cffi: file too small — likely auth required or empty response')
         return False
     log(f'  curl_cffi done: {fmt(os.path.getsize(out))}')
     uploader.upload_file(out)
@@ -569,15 +632,21 @@ def process(url: str, drive, folder_id: str):
     try:
         magnet = is_magnet(url)
 
+        magnet  = is_magnet(url)
+        gofile  = 'gofile.io' in url
+
         if magnet:
             fname = resolve_magnet(url)
             size  = 0
             final = url
+        elif gofile:
+            final, fname, size, _token = resolve_gofile(url)
         else:
             final, fname, size = resolve_url(url)
-            if file_exists(drive, folder_id, fname, size):
-                log('  ✓ Already on GDrive — skipping')
-                return
+
+        if not magnet and file_exists(drive, folder_id, fname, size):
+            log('  ✓ Already on GDrive — skipping')
+            return
 
         uploader = StreamUploader(folder_id, fname, size)
         t0       = time.time()
