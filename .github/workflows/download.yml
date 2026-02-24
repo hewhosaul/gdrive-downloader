@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      PYTHONUNBUFFERED: "1"    # live logs fix — flush Python output immediately
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout
@@ -23,6 +23,11 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2 curl
+
+          # Install rclone (latest stable)
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
           pip install -q \
             yt-dlp \
             curl_cffi \
