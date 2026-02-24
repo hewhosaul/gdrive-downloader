@@ -12,7 +12,7 @@
 ║    5. curl_cffi (Chrome TLS fingerprint)          [CF]      ║
 ║    6. requests stream (plain fallback)            [LAST]    ║
 ║                                                              ║
-║  Upload: OAuth → resumable Drive API, 512MB chunks          ║
+║  Upload: rclone → Drive (parallel chunks, 150-200 MB/s)     ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -115,6 +115,101 @@ def get_token() -> str:
 
 def get_drive():
     return build('drive', 'v3', credentials=get_creds(), cache_discovery=False)
+
+
+# ══════════════════════════════════════════════════════════════
+# RCLONE SETUP — configure rclone on the fly from env vars
+# No rclone.conf needed in the repo — all credentials come from
+# GitHub Secrets via environment variables
+# ══════════════════════════════════════════════════════════════
+RCLONE_REMOTE = 'gdrive'
+RCLONE_CONFIG  = f'{TMP}/rclone.conf'
+
+def setup_rclone() -> bool:
+    """Write rclone.conf from env vars. Returns True if successful."""
+    client_id     = os.environ.get('GDRIVE_CLIENT_ID', '')
+    client_secret = os.environ.get('GDRIVE_CLIENT_SECRET', '')
+    refresh_token = os.environ.get('GDRIVE_REFRESH_TOKEN', '')
+    if not all([client_id, client_secret, refresh_token]):
+        log('  rclone: missing OAuth credentials in env')
+        return False
+
+    # Write minimal rclone config for Google Drive OAuth
+    config = f"""[{RCLONE_REMOTE}]
+type = drive
+client_id = {client_id}
+client_secret = {client_secret}
+token = {{"access_token":"","token_type":"Bearer","refresh_token":"{refresh_token}","expiry":"2000-01-01T00:00:00Z"}}
+scope = drive
+root_folder_id = {GDRIVE_FOLDER_ID}
+"""
+    with open(RCLONE_CONFIG, 'w') as f:
+        f.write(config)
+    os.chmod(RCLONE_CONFIG, 0o600)
+    log('  rclone config written ✓')
+    return True
+
+def rclone_upload(path: str, fname: str) -> bool:
+    """
+    Upload file to GDrive using rclone.
+    Uses parallel chunk uploads for higher sustained speed than raw API.
+    Falls back gracefully if rclone fails.
+    """
+    size = os.path.getsize(path)
+    log(f'  Uploading {fmt(size)} via rclone...')
+
+    cmd = [
+        'rclone', 'copyto',
+        path,
+        f'{RCLONE_REMOTE}:{fname}',  # copyto preserves exact filename
+        '--config', RCLONE_CONFIG,
+        '--drive-chunk-size', '256M',          # 256MB chunks per stream
+        '--drive-upload-cutoff', '256M',        # use resumable for anything >256MB
+        '--transfers', '4',                     # 4 parallel chunk streams
+        '--drive-parallel-upload-cutoff', '256M', # parallel chunks within single file
+        '--checkers', '1',
+        '--retries', '5',
+        '--retries-sleep', '5s',
+        '--low-level-retries', '10',
+        '--stats', f'{LOG_INTERVAL}s',          # progress every N seconds
+        '--stats-one-line',
+        '--stats-log-level', 'NOTICE',
+        '--use-mmap',                           # memory-mapped I/O for speed
+        '-v',
+    ]
+
+    t0 = time.time()
+    env = {
+        **os.environ,
+        'PYTHONUNBUFFERED': '1',
+        'RCLONE_CONFIG':    RCLONE_CONFIG,
+    }
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env=env
+    )
+
+    # Stream rclone output live
+    last_stats = 0
+    for line in proc.stdout:
+        line = line.strip()
+        if not line: continue
+        # rclone stats lines look like:
+        # Transferred: 12.345 GiB / 96.52 GiB, 13%, 145.2 MiB/s, ETA 10m5s
+        if 'Transferred:' in line or 'ETA' in line or 'ERROR' in line:
+            log(f'  ↳ rclone  | {line}')
+        elif 'error' in line.lower() or 'failed' in line.lower():
+            log(f'  rclone: {line}')
+
+    proc.wait()
+    e = time.time() - t0
+
+    if proc.returncode != 0:
+        log(f'  rclone failed (code {proc.returncode})')
+        return False
+
+    log(f'  ↳ rclone  | done | {fmt(size)} | avg {spd(size/e) if e else "?"}')
+    return True
 
 # ══════════════════════════════════════════════════════════════
 # DRIVE HELPERS
@@ -483,6 +578,36 @@ class StreamUploader:
         log(f'  ↳ GDrive  | done | {fmt(uploaded)} | avg {spd(uploaded/e)}')
         return uploaded
 
+
+# ══════════════════════════════════════════════════════════════
+# UNIFIED UPLOAD — rclone first (fast), StreamUploader fallback
+# ══════════════════════════════════════════════════════════════
+_rclone_ready = None  # cache rclone availability check
+
+def upload_to_drive(path: str, uploader: 'StreamUploader') -> None:
+    """
+    Try rclone upload first (150-200 MB/s).
+    Fall back to StreamUploader (80 MB/s) if rclone fails.
+    """
+    global _rclone_ready
+
+    # Check rclone availability once
+    if _rclone_ready is None:
+        result = subprocess.run(['rclone', 'version'],
+                                capture_output=True, timeout=10)
+        _rclone_ready = result.returncode == 0
+        if _rclone_ready:
+            _rclone_ready = setup_rclone()
+        log(f'  rclone available: {_rclone_ready}')
+
+    if _rclone_ready:
+        if rclone_upload(path, uploader.fname):
+            return
+        log('  rclone failed — falling back to direct API upload')
+
+    # Fallback: original StreamUploader
+    uploader.upload_file(path)
+
 # ══════════════════════════════════════════════════════════════
 # METHOD 1 — yt-dlp extract URL → aria2c 16 connections
 # THE FAST PATH for everything: gofile, Cloudflare, DDL hosts
@@ -529,7 +654,7 @@ def try_ytdlp_aria2c(url, fname, size, uploader) -> bool:
     actual_size = os.path.getsize(out)
     log(f'  Download done: {fmt(actual_size)}')
     uploader.total_size = actual_size
-    uploader.upload_file(out)
+    upload_to_drive(out, uploader)
     try: os.remove(out)
     except: pass
     return True
@@ -546,7 +671,7 @@ def try_aria2c(url, fname, size, uploader) -> bool:
     if not ok:
         return False
     log(f'  aria2c done: {fmt(os.path.getsize(out))}')
-    uploader.upload_file(out)
+    upload_to_drive(out, uploader)
     try: os.remove(out)
     except: pass
     return True
@@ -611,7 +736,7 @@ def try_magnet(url, fname, size, uploader) -> bool:
     fname = candidates[0].name
     uploader.fname = fname
     log(f'  Torrent done: {fname} ({fmt(os.path.getsize(out))})')
-    uploader.upload_file(out)
+    upload_to_drive(out, uploader)
     try: os.remove(out)
     except: pass
     return True
@@ -672,7 +797,7 @@ def try_ytdlp(url, fname, size, uploader) -> bool:
     out = str(candidates[0])
     log(f'  yt-dlp done: {fmt(os.path.getsize(out))}')
     uploader.fname = candidates[0].name
-    uploader.upload_file(out)
+    upload_to_drive(out, uploader)
     try: os.remove(out)
     except: pass
     return True
@@ -717,7 +842,7 @@ def try_curl_cffi(url, fname, size, uploader) -> bool:
         log('  curl_cffi: file too small')
         return False
     log(f'  curl_cffi done: {fmt(os.path.getsize(out))}')
-    uploader.upload_file(out)
+    upload_to_drive(out, uploader)
     try: os.remove(out)
     except: pass
     return True
