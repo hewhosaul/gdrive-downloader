@@ -12,7 +12,7 @@
 ║    5. curl_cffi (Chrome TLS fingerprint)          [CF]      ║
 ║    6. requests stream (plain fallback)            [LAST]    ║
 ║                                                              ║
-║  Upload: rclone → Drive (parallel chunks, 150-200 MB/s)     ║
+║  Upload: OAuth → resumable Drive API, 512MB chunks          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -116,95 +116,6 @@ def get_token() -> str:
 def get_drive():
     return build('drive', 'v3', credentials=get_creds(), cache_discovery=False)
 
-
-# ══════════════════════════════════════════════════════════════
-# RCLONE SETUP — configure rclone on the fly from env vars
-# No rclone.conf needed in the repo — all credentials come from
-# GitHub Secrets via environment variables
-# ══════════════════════════════════════════════════════════════
-RCLONE_REMOTE = 'gdrive'
-RCLONE_CONFIG  = f'{TMP}/rclone.conf'
-
-def setup_rclone() -> bool:
-    """Write rclone.conf from env vars. Returns True if successful."""
-    client_id     = os.environ.get('GDRIVE_CLIENT_ID', '')
-    client_secret = os.environ.get('GDRIVE_CLIENT_SECRET', '')
-    refresh_token = os.environ.get('GDRIVE_REFRESH_TOKEN', '')
-    if not all([client_id, client_secret, refresh_token]):
-        log('  rclone: missing OAuth credentials in env')
-        return False
-
-    # Write minimal rclone config for Google Drive OAuth
-    config = f"""[{RCLONE_REMOTE}]
-type = drive
-client_id = {client_id}
-client_secret = {client_secret}
-token = {{"access_token":"","token_type":"Bearer","refresh_token":"{refresh_token}","expiry":"2000-01-01T00:00:00Z"}}
-scope = drive
-root_folder_id = {GDRIVE_FOLDER_ID}
-"""
-    with open(RCLONE_CONFIG, 'w') as f:
-        f.write(config)
-    os.chmod(RCLONE_CONFIG, 0o600)
-    log('  rclone config written ✓')
-    return True
-
-def rclone_upload(path: str, fname: str) -> bool:
-    """
-    Upload file to GDrive using rclone.
-    Uses parallel chunk uploads for higher sustained speed than raw API.
-    Falls back gracefully if rclone fails.
-    """
-    size = os.path.getsize(path)
-    log(f'  Uploading {fmt(size)} via rclone...')
-
-    cmd = [
-        'rclone', 'copyto',
-        path,
-        f'{RCLONE_REMOTE}:{fname}',
-        '--config', RCLONE_CONFIG,
-        '--drive-chunk-size', '512M',      # large chunks = fewer round trips
-        '--drive-upload-cutoff', '512M',   # resumable for files >512MB
-        '--retries', '5',
-        '--retries-sleep', '5s',
-        '--low-level-retries', '10',
-        '--stats', f'{LOG_INTERVAL}s',
-        '--stats-one-line',
-        '--stats-log-level', 'NOTICE',
-        '--use-mmap',
-        '-v',
-    ]
-
-    t0 = time.time()
-    env = {
-        **os.environ,
-        'PYTHONUNBUFFERED': '1',
-        'RCLONE_CONFIG':    RCLONE_CONFIG,
-    }
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, env=env
-    )
-
-    # Stream rclone output live — print everything for debugging
-    for line in proc.stdout:
-        line = line.strip()
-        if not line: continue
-        # Always print errors and stats
-        if any(x in line for x in ('Transferred:', 'ETA', 'ERROR', 'error',
-                                    'failed', 'Fatal', 'flag', 'unknown')):
-            log(f'  ↳ rclone  | {line}')
-
-    proc.wait()
-    e = time.time() - t0
-
-    if proc.returncode != 0:
-        log(f'  rclone failed (code {proc.returncode}) — falling back to direct API')
-        return False
-
-    log(f'  ↳ rclone  | done | {fmt(size)} | avg {spd(size/e) if e else "?"}')
-    return True
-
 # ══════════════════════════════════════════════════════════════
 # DRIVE HELPERS
 # ══════════════════════════════════════════════════════════════
@@ -291,72 +202,97 @@ def resolve_magnet(url: str) -> str:
 # ══════════════════════════════════════════════════════════════
 def ytdlp_extract(url: str) -> dict | None:
     """
-    Use yt-dlp to extract the real CDN download URL + cookies.
-    Two-step process:
-      1. --get-url  → fast, just prints the direct download URL
-      2. --cookies  → saves session cookies for aria2c to reuse
-    Works for: gofile, Cloudflare sites, any yt-dlp supported site.
-    Returns None cleanly for plain HTTP servers (aria2c handles those directly).
+    Returns dict with keys: url, filename, filesize, headers, cookies_file
+    Returns None if yt-dlp can't extract a direct URL.
     """
-    log('  yt-dlp extracting CDN URL...')
-    env = {**os.environ, 'PYTHONUNBUFFERED': '1'}
+    log('  yt-dlp extracting real CDN URL...')
 
-    # Step 1: extract direct URL (fast, no download)
-    url_cmd = [
+    # Get JSON metadata — filename, url, filesize, http headers
+    cmd = [
         'yt-dlp',
         '--no-playlist', '--no-warnings',
-        '--get-url',               # just print the download URL
+        '--dump-json',                     # output metadata as JSON
+        '--no-download',                   # don't actually download
         '--user-agent', UA,
         '--no-check-certificate',
+        '--cookies', COOKIES_FILE,         # save session cookies
         '--extractor-args', 'generic:impersonate',
         url
     ]
     try:
-        r = subprocess.run(url_cmd, capture_output=True, text=True,
-                           timeout=60, env=env)
-        # Filter to just http lines (yt-dlp sometimes prints extra info)
-        urls = [l.strip() for l in r.stdout.strip().splitlines()
-                if l.strip().startswith('http')]
-        if not urls:
-            log(f'  yt-dlp: no URL extracted ({r.stderr[-200:].strip()})')
+        env = {**os.environ, 'PYTHONUNBUFFERED': '1'}
+        r   = subprocess.run(cmd, capture_output=True, text=True,
+                             timeout=90, env=env)
+        if r.returncode != 0 or not r.stdout.strip():
+            log(f'  yt-dlp extract failed: {r.stderr[-300:].strip()}')
             return None
-        direct_url = urls[-1]  # take last URL (best quality for multi-format)
-        log(f'  CDN URL: {direct_url[:80]}')
+
+        # yt-dlp may output multiple JSON objects (playlist) — take last
+        lines = [l for l in r.stdout.strip().splitlines() if l.startswith('{')]
+        if not lines:
+            return None
+
+        info = json.loads(lines[-1])
+
+        # Get the best format URL
+        direct_url = None
+        filename   = None
+        filesize   = 0
+        http_hdrs  = {}
+
+        # Try formats list first (for sites with multiple qualities)
+        formats = info.get('formats', [])
+        if formats:
+            # Pick best quality (last format is usually best)
+            best = formats[-1]
+            direct_url = best.get('url', '')
+            filesize   = best.get('filesize') or best.get('filesize_approx') or 0
+            http_hdrs  = best.get('http_headers', {})
+        
+        # Fall back to top-level url
+        if not direct_url:
+            direct_url = info.get('url', '')
+            filesize   = info.get('filesize') or info.get('filesize_approx') or 0
+            http_hdrs  = info.get('http_headers', {})
+
+        if not direct_url or not direct_url.startswith('http'):
+            log('  yt-dlp: no direct URL in metadata')
+            return None
+
+        # Get filename
+        filename = (
+            info.get('filename') or
+            info.get('_filename') or
+            info.get('title', '')
+        )
+        ext = info.get('ext', 'mkv')
+        if filename and not Path(filename).suffix:
+            filename = f'{filename}.{ext}'
+        if not filename:
+            filename = f'{info.get("id", "file")}.{ext}'
+        filename = sanitize(Path(filename).name)
+
+        log(f'  Extracted: {filename}')
+        log(f'  CDN URL  : {direct_url[:80]}')
+        log(f'  Size     : {fmt(filesize) if filesize else "unknown"}')
+
+        return {
+            'url':          direct_url,
+            'filename':     filename,
+            'filesize':     filesize,
+            'headers':      http_hdrs,
+            'cookies_file': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
+        }
+
+    except json.JSONDecodeError as e:
+        log(f'  yt-dlp JSON parse error: {e}')
+        return None
     except subprocess.TimeoutExpired:
-        log('  yt-dlp URL extraction timed out')
+        log('  yt-dlp extract timed out (90s)')
         return None
     except Exception as e:
-        log(f'  yt-dlp error: {e}')
+        log(f'  yt-dlp extract error: {e}')
         return None
-
-    # Step 2: save cookies (best effort, don't fail if this errors)
-    try:
-        cookie_cmd = [
-            'yt-dlp',
-            '--no-playlist', '--no-warnings',
-            '--skip-download',
-            '--cookies', COOKIES_FILE,
-            '--user-agent', UA,
-            '--no-check-certificate',
-            '--extractor-args', 'generic:impersonate',
-            url
-        ]
-        subprocess.run(cookie_cmd, capture_output=True, timeout=60, env=env)
-    except Exception:
-        pass  # cookies are best-effort
-
-    # Step 3: get filename from original URL since --get-url loses it
-    # For sites like gofile, the original URL path has the filename
-    path  = unquote(urlparse(url).path)
-    fname = sanitize(Path(path).name or f'file_{int(time.time())}.mkv')
-
-    return {
-        'url':          direct_url,
-        'filename':     fname,
-        'filesize':     0,   # unknown at extract time, aria2c will get it
-        'headers':      {},
-        'cookies_file': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
-    }
 
 # ══════════════════════════════════════════════════════════════
 # PROGRESS MONITOR — background thread, logs every N seconds
@@ -547,36 +483,6 @@ class StreamUploader:
         log(f'  ↳ GDrive  | done | {fmt(uploaded)} | avg {spd(uploaded/e)}')
         return uploaded
 
-
-# ══════════════════════════════════════════════════════════════
-# UNIFIED UPLOAD — rclone first (fast), StreamUploader fallback
-# ══════════════════════════════════════════════════════════════
-_rclone_ready = None  # cache rclone availability check
-
-def upload_to_drive(path: str, uploader: 'StreamUploader') -> None:
-    """
-    Try rclone upload first (150-200 MB/s).
-    Fall back to StreamUploader (80 MB/s) if rclone fails.
-    """
-    global _rclone_ready
-
-    # Check rclone availability once
-    if _rclone_ready is None:
-        result = subprocess.run(['rclone', 'version'],
-                                capture_output=True, timeout=10)
-        _rclone_ready = result.returncode == 0
-        if _rclone_ready:
-            _rclone_ready = setup_rclone()
-        log(f'  rclone available: {_rclone_ready}')
-
-    if _rclone_ready:
-        if rclone_upload(path, uploader.fname):
-            return
-        log('  rclone failed — falling back to direct API upload')
-
-    # Fallback: original StreamUploader
-    uploader.upload_file(path)
-
 # ══════════════════════════════════════════════════════════════
 # METHOD 1 — yt-dlp extract URL → aria2c 16 connections
 # THE FAST PATH for everything: gofile, Cloudflare, DDL hosts
@@ -623,7 +529,7 @@ def try_ytdlp_aria2c(url, fname, size, uploader) -> bool:
     actual_size = os.path.getsize(out)
     log(f'  Download done: {fmt(actual_size)}')
     uploader.total_size = actual_size
-    upload_to_drive(out, uploader)
+    uploader.upload_file(out)
     try: os.remove(out)
     except: pass
     return True
@@ -640,7 +546,7 @@ def try_aria2c(url, fname, size, uploader) -> bool:
     if not ok:
         return False
     log(f'  aria2c done: {fmt(os.path.getsize(out))}')
-    upload_to_drive(out, uploader)
+    uploader.upload_file(out)
     try: os.remove(out)
     except: pass
     return True
@@ -705,7 +611,7 @@ def try_magnet(url, fname, size, uploader) -> bool:
     fname = candidates[0].name
     uploader.fname = fname
     log(f'  Torrent done: {fname} ({fmt(os.path.getsize(out))})')
-    upload_to_drive(out, uploader)
+    uploader.upload_file(out)
     try: os.remove(out)
     except: pass
     return True
@@ -766,7 +672,7 @@ def try_ytdlp(url, fname, size, uploader) -> bool:
     out = str(candidates[0])
     log(f'  yt-dlp done: {fmt(os.path.getsize(out))}')
     uploader.fname = candidates[0].name
-    upload_to_drive(out, uploader)
+    uploader.upload_file(out)
     try: os.remove(out)
     except: pass
     return True
@@ -811,7 +717,7 @@ def try_curl_cffi(url, fname, size, uploader) -> bool:
         log('  curl_cffi: file too small')
         return False
     log(f'  curl_cffi done: {fmt(os.path.getsize(out))}')
-    upload_to_drive(out, uploader)
+    uploader.upload_file(out)
     try: os.remove(out)
     except: pass
     return True
@@ -915,12 +821,7 @@ def main():
         log('ERROR: No URLs provided. Set DOWNLOAD_URLS.')
         sys.exit(1)
 
-    def clean_url(u: str) -> str:
-        # Strip backslash escapes zsh adds to special chars in URLs
-        # e.g. \? → ?   \& → &   \= → =
-        return u.replace('\\?', '?').replace('\\&', '&').replace('\\=', '=')
-
-    urls = [clean_url(u.strip()) for u in re.split(r'[,\n]+', raw)
+    urls = [u.strip() for u in re.split(r'[,\n]+', raw)
             if u.strip() and not u.strip().startswith('#')]
     if not urls:
         log('ERROR: No valid URLs found.')
