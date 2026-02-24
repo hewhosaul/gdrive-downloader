@@ -915,7 +915,12 @@ def main():
         log('ERROR: No URLs provided. Set DOWNLOAD_URLS.')
         sys.exit(1)
 
-    urls = [u.strip() for u in re.split(r'[,\n]+', raw)
+    def clean_url(u: str) -> str:
+        # Strip backslash escapes zsh adds to special chars in URLs
+        # e.g. \? → ?   \& → &   \= → =
+        return u.replace('\\?', '?').replace('\\&', '&').replace('\\=', '=')
+
+    urls = [clean_url(u.strip()) for u in re.split(r'[,\n]+', raw)
             if u.strip() and not u.strip().startswith('#')]
     if not urls:
         log('ERROR: No valid URLs found.')
