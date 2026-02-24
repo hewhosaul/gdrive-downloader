@@ -161,20 +161,17 @@ def rclone_upload(path: str, fname: str) -> bool:
     cmd = [
         'rclone', 'copyto',
         path,
-        f'{RCLONE_REMOTE}:{fname}',  # copyto preserves exact filename
+        f'{RCLONE_REMOTE}:{fname}',
         '--config', RCLONE_CONFIG,
-        '--drive-chunk-size', '256M',          # 256MB chunks per stream
-        '--drive-upload-cutoff', '256M',        # use resumable for anything >256MB
-        '--transfers', '4',                     # 4 parallel chunk streams
-        '--drive-parallel-upload-cutoff', '256M', # parallel chunks within single file
-        '--checkers', '1',
+        '--drive-chunk-size', '512M',      # large chunks = fewer round trips
+        '--drive-upload-cutoff', '512M',   # resumable for files >512MB
         '--retries', '5',
         '--retries-sleep', '5s',
         '--low-level-retries', '10',
-        '--stats', f'{LOG_INTERVAL}s',          # progress every N seconds
+        '--stats', f'{LOG_INTERVAL}s',
         '--stats-one-line',
         '--stats-log-level', 'NOTICE',
-        '--use-mmap',                           # memory-mapped I/O for speed
+        '--use-mmap',
         '-v',
     ]
 
@@ -189,23 +186,20 @@ def rclone_upload(path: str, fname: str) -> bool:
         text=True, bufsize=1, env=env
     )
 
-    # Stream rclone output live
-    last_stats = 0
+    # Stream rclone output live — print everything for debugging
     for line in proc.stdout:
         line = line.strip()
         if not line: continue
-        # rclone stats lines look like:
-        # Transferred: 12.345 GiB / 96.52 GiB, 13%, 145.2 MiB/s, ETA 10m5s
-        if 'Transferred:' in line or 'ETA' in line or 'ERROR' in line:
+        # Always print errors and stats
+        if any(x in line for x in ('Transferred:', 'ETA', 'ERROR', 'error',
+                                    'failed', 'Fatal', 'flag', 'unknown')):
             log(f'  ↳ rclone  | {line}')
-        elif 'error' in line.lower() or 'failed' in line.lower():
-            log(f'  rclone: {line}')
 
     proc.wait()
     e = time.time() - t0
 
     if proc.returncode != 0:
-        log(f'  rclone failed (code {proc.returncode})')
+        log(f'  rclone failed (code {proc.returncode}) — falling back to direct API')
         return False
 
     log(f'  ↳ rclone  | done | {fmt(size)} | avg {spd(size/e) if e else "?"}')
