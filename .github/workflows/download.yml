@@ -19,6 +19,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Cloudflare WARP
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt update && sudo apt install cloudflare-warp -y
+
+      - name: Start WARP
+        run: |
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos connect
+          # Loop to wait for the tunnel to go active
+          for i in {1..12}; do
+            if curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
+              echo "WARP is successfully connected!"
+              curl -s https://www.cloudflare.com/cdn-cgi/trace
+              break
+            fi
+            echo "Waiting for WARP connection (attempt $i)..."
+            sleep 5
+          done
+
       - name: Install tools
         run: |
           sudo apt-get update -qq
@@ -31,7 +52,7 @@ jobs:
             google-auth-oauthlib \
             google-auth \
             requests \
-            mega.py          # Mega.nz API — bypasses Azure CDN IP blocks
+            mega.py
 
       - name: Run downloader
         env:
