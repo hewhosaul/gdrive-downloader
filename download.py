@@ -18,7 +18,6 @@ from pathlib import Path
 from urllib.parse import urlparse, unquote
 
 import requests as req_lib
-from tqdm import tqdm
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
@@ -28,8 +27,8 @@ from googleapiclient.discovery import build
 # ══════════════════════════════════════════════════════════════════
 GDRIVE_FOLDER_ID = '1TRND8VlWi0U7wdHk3HLJ7hvzOw90PDE3'
 
-CHUNK_SIZE    = 512 * 1024 * 1024   # 512MB upload chunks
-DL_CHUNK      = 8   * 1024 * 1024   # 8MB read buffer
+UPLOAD_CHUNK  = 256 * 1024 * 1024   # 256MB per PUT — sweet spot for Drive API
+DL_CHUNK      = 16  * 1024 * 1024   # 16MB read buffer for disk→upload
 ARIA2C_CONNS  = 16
 TMP           = tempfile.mkdtemp(prefix='dl_')
 
@@ -288,71 +287,85 @@ class StreamUploader:
                 log(f'  Upload retry {attempt+1}/6 in {wait}s: {e}')
                 time.sleep(wait)
 
-    def run(self, stream_iter, bar_desc='Upload'):
+    def run_file(self, path: str):
+        """Upload a file directly — no intermediate buffer, reads in UPLOAD_CHUNK blocks."""
+        self.total_size = os.path.getsize(path)
         self._start()
-        buf = b''; uploaded = 0; t0 = time.time()
-        bar = tqdm(total=self.total_size or None, unit='B',
-                   unit_scale=True, unit_divisor=1024,
-                   desc=f'  {bar_desc}', colour='green',
-                   dynamic_ncols=True, miniters=1, file=sys.stdout)
+        uploaded = 0; t0 = time.time(); last_log = 0
+        log(f'  Uploading {fmt(self.total_size)} to GDrive...')
+        with open(path, 'rb') as f:
+            while True:
+                data = f.read(UPLOAD_CHUNK)
+                if not data:
+                    break
+                is_last = (uploaded + len(data) >= self.total_size)
+                self._put_chunk(data, uploaded, is_last)
+                uploaded += len(data)
+                now = time.time()
+                if now - last_log >= 8:
+                    e = now - t0
+                    pct = f'{uploaded*100//self.total_size}%' if self.total_size else '?'
+                    log(f'  ↳ GDrive | {pct} | {fmt(uploaded)} | {spd(uploaded/e)}')
+                    last_log = now
+        e = time.time() - t0
+        log(f'  ↳ GDrive | done | {fmt(uploaded)} | avg {spd(uploaded/e)}')
+        return uploaded
+
+    def run(self, stream_iter, bar_desc='Upload'):
+        """Legacy stream-based upload — kept for requests fallback method."""
+        self._start()
+        buf = b''; uploaded = 0; t0 = time.time(); last_log = 0
+        log(f'  Uploading to GDrive (streaming)...')
         for chunk in stream_iter:
             if not chunk: continue
             buf += chunk
-            while len(buf) >= CHUNK_SIZE:
-                piece = buf[:CHUNK_SIZE]; buf = buf[CHUNK_SIZE:]
+            while len(buf) >= UPLOAD_CHUNK:
+                piece = buf[:UPLOAD_CHUNK]; buf = buf[UPLOAD_CHUNK:]
                 self._put_chunk(piece, uploaded, is_last=False)
-                uploaded += len(piece); bar.update(len(piece))
-                e = time.time() - t0
-                if e: bar.set_postfix(speed=spd(uploaded/e), refresh=True)
+                uploaded += len(piece)
+                now = time.time()
+                if now - last_log >= 8:
+                    e = now - t0
+                    log(f'  ↳ GDrive | {fmt(uploaded)} | {spd(uploaded/e)}')
+                    last_log = now
         if buf:
             if not self.total_size:
                 self.total_size = uploaded + len(buf)
             self._put_chunk(buf, uploaded, is_last=True)
-            uploaded += len(buf); bar.update(len(buf))
-        bar.close()
+            uploaded += len(buf)
         e = time.time() - t0
-        log(f'  Uploaded {fmt(uploaded)} in {e:.1f}s ({spd(uploaded/e)})')
+        log(f'  ↳ GDrive | done | {fmt(uploaded)} | avg {spd(uploaded/e)}')
         return uploaded
 
 # ══════════════════════════════════════════════════════════════════
-# UNIFIED UPLOAD — rclone first, StreamUploader fallback
+# UPLOAD — direct Drive API, 256MB chunks, plain progress logging
 # ══════════════════════════════════════════════════════════════════
 def upload_file(path: str, uploader: StreamUploader):
-    """Try rclone first. Fall back to direct API if rclone fails."""
-    if rclone_available():
-        if rclone_upload(path, uploader.fname):
-            return
-        log('  rclone failed — falling back to direct API upload')
-    # Fallback: original StreamUploader
-    def gen():
-        with open(path, 'rb') as f:
-            while True:
-                c = f.read(DL_CHUNK)
-                if not c: break
-                yield c
-    uploader.run(gen(), bar_desc=f'GDrive  {uploader.fname[:35]}')
+    """Upload file to GDrive using resumable API with 256MB chunks."""
+    uploader.run_file(path)
 
 # ══════════════════════════════════════════════════════════════════
 # PROGRESS BAR POLLER
 # ══════════════════════════════════════════════════════════════════
 def poll_bar(proc, out_path, size, desc):
-    bar = tqdm(total=size or None, unit='B', unit_scale=True,
-               unit_divisor=1024, desc=f'  {desc}', colour='cyan',
-               dynamic_ncols=True, miniters=1, file=sys.stdout)
-    t0 = time.time(); prev = 0
+    t0 = time.time(); prev = 0; last_log = 0
     while proc.poll() is None:
         try:   cur = os.path.getsize(out_path)
         except OSError: cur = 0
-        if cur > prev:
-            bar.update(cur - prev)
-            e = time.time() - t0
-            if e: bar.set_postfix(speed=spd(cur/e), refresh=True)
+        now = time.time()
+        if cur > prev and now - last_log >= 8:
+            e = now - t0
+            pct = f'{cur*100//size}%' if size else fmt(cur)
+            log(f'  ↳ {desc} | {pct} | {fmt(cur)} | {spd(cur/e)}')
+            last_log = now
             prev = cur
-        time.sleep(0.3)
+        time.sleep(1)
     try:
-        cur = os.path.getsize(out_path); bar.update(cur - prev)
+        cur = os.path.getsize(out_path)
+        e = time.time() - t0
+        if e and cur:
+            log(f'  ↳ {desc} | done | {fmt(cur)} | avg {spd(cur/e)}')
     except OSError: pass
-    bar.close()
 
 # ══════════════════════════════════════════════════════════════════
 # METHOD 1 — aria2c (16 connections, 1MB splits)
@@ -415,26 +428,13 @@ def try_ytdlp(url, fname, size, uploader) -> bool:
     t0   = time.time()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, bufsize=1)
-    bar  = tqdm(total=size or None, unit='B', unit_scale=True,
-                unit_divisor=1024, desc=f'  yt-dlp  {fname[:35]}',
-                colour='magenta', dynamic_ncols=True,
-                miniters=1, file=sys.stdout)
-    prev = 0
     for line in proc.stdout:
         line = line.strip()
-        m = re.search(r'\[download\]\s+([\d.]+)%\s+of\s+~?\s*([\d.]+)(GiB|MiB|KiB|B)', line)
-        if m:
-            pct  = float(m.group(1)) / 100
-            mult = {'GiB': 1<<30, 'MiB': 1<<20, 'KiB': 1<<10, 'B': 1}[m.group(3)]
-            cur  = int(pct * float(m.group(2)) * mult)
-            if cur > prev:
-                bar.update(cur - prev)
-                e = time.time() - t0
-                if e: bar.set_postfix(speed=spd(cur/e), refresh=True)
-                prev = cur
+        if line and '[download]' in line:
+            log(f'  {line}')
         elif line and '[download]' not in line:
             log(f'    {line}')
-    bar.close(); proc.wait()
+    proc.wait()
     candidates = sorted(Path(TMP).glob(f'{stem}.*'),
                         key=lambda p: p.stat().st_size, reverse=True)
     if not candidates or candidates[0].stat().st_size < 10000:
@@ -462,11 +462,7 @@ def try_curl_cffi(url, fname, size, uploader) -> bool:
 
     out  = f'{TMP}/{fname}'
     part = out + '.part'
-    t0   = time.time(); done = 0
-    bar  = tqdm(total=size or None, unit='B', unit_scale=True,
-                unit_divisor=1024, desc=f'  cffi    {fname[:35]}',
-                colour='yellow', dynamic_ncols=True,
-                miniters=1, file=sys.stdout)
+    t0 = time.time(); done = 0; last_log = 0
     try:
         r = cffi_req.get(url, stream=True, timeout=120,
                          impersonate='chrome120',
@@ -475,13 +471,15 @@ def try_curl_cffi(url, fname, size, uploader) -> bool:
         with open(part, 'wb') as f:
             for chunk in r.iter_content(chunk_size=DL_CHUNK):
                 if chunk:
-                    f.write(chunk); done += len(chunk); bar.update(len(chunk))
-                    e = time.time() - t0
-                    if e: bar.set_postfix(speed=spd(done/e), refresh=True)
-        bar.close()
+                    f.write(chunk); done += len(chunk)
+                    now = time.time()
+                    if now - last_log >= 8:
+                        e = now - t0
+                        pct = f'{done*100//size}%' if size else fmt(done)
+                        log(f'  ↳ cffi | {pct} | {fmt(done)} | {spd(done/e)}')
+                        last_log = now
         os.rename(part, out)
     except Exception as e:
-        bar.close()
         log(f'  curl_cffi failed: {e}')
         return False
 
@@ -502,25 +500,22 @@ def try_requests(url, fname, size, uploader) -> bool:
     log('  [4/4] requests stream (plain fallback)')
     out  = f'{TMP}/{fname}'
     part = out + '.part'
-    t0   = time.time()
-    bar  = tqdm(total=size or None, unit='B', unit_scale=True,
-                unit_divisor=1024, desc=f'  stream  {fname[:35]}',
-                colour='white', dynamic_ncols=True,
-                miniters=1, file=sys.stdout)
+    t0 = time.time(); done = 0; last_log = 0
     try:
-        done = 0
         with SESSION.get(url, stream=True, timeout=120) as r:
             r.raise_for_status()
             with open(part, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=DL_CHUNK):
                     if chunk:
-                        f.write(chunk); done += len(chunk); bar.update(len(chunk))
-                        e = time.time() - t0
-                        if e: bar.set_postfix(speed=spd(done/e), refresh=True)
-        bar.close()
+                        f.write(chunk); done += len(chunk)
+                        now = time.time()
+                        if now - last_log >= 8:
+                            e = now - t0
+                            pct = f'{done*100//size}%' if size else fmt(done)
+                            log(f'  ↳ stream | {pct} | {fmt(done)} | {spd(done/e)}')
+                            last_log = now
         os.rename(part, out)
     except Exception as e:
-        bar.close()
         log(f'  requests failed: {e}')
         return False
 
