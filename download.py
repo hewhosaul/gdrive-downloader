@@ -3,16 +3,13 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║           GDrive Downloader — GitHub Actions                 ║
-║                                                              ║
-║  Download waterfall (for every URL):                         ║
-║    1. yt-dlp extract URL → aria2c 16 connections  [FAST]    ║
-║    2. aria2c direct HTTP                          [FAST]    ║
-║    3. aria2c Magnet/Torrent (for magnet: links)   [P2P]     ║
-║    4. yt-dlp full download (single thread)        [COMPAT]  ║
-║    5. curl_cffi (Chrome TLS fingerprint)          [CF]      ║
-║    6. requests stream (plain fallback)            [LAST]    ║
-║                                                              ║
-║  Upload: OAuth → resumable Drive API, 512MB chunks          ║
+║  Download waterfall:                                         ║
+║    1. aria2c  — HTTP/HTTPS, 16 parallel, 1MB splits          ║
+║    2. aria2c  — Magnet/torrent (BitTorrent protocol)         ║
+║    3. yt-dlp  — Cloudflare bypass via curl_cffi              ║
+║    4. curl_cffi — browser TLS fingerprint                    ║
+║    5. requests — plain HTTP fallback                         ║
+║  Upload: OAuth → resumable Drive API, 512MB chunks           ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -20,7 +17,7 @@ import os, sys, re, time, json, subprocess, tempfile, threading
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
-# ── Force unbuffered output — critical for GitHub Actions live logs ──
+# ── Force unbuffered output — THE fix for GitHub Actions live logs ──
 os.environ['PYTHONUNBUFFERED'] = '1'
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(line_buffering=True)
@@ -34,12 +31,11 @@ from googleapiclient.discovery import build
 # CONFIG
 # ══════════════════════════════════════════════════════════════
 GDRIVE_FOLDER_ID = '1TRND8VlWi0U7wdHk3HLJ7hvzOw90PDE3'
-UPLOAD_CHUNK     = 512 * 1024 * 1024   # 512MB upload chunks
+UPLOAD_CHUNK     = 512 * 1024 * 1024   # 512MB — fewer API round trips
 DL_CHUNK         = 16  * 1024 * 1024   # 16MB read buffer
-ARIA2C_CONNS     = 16                  # parallel connections
-LOG_INTERVAL     = 8                   # seconds between progress lines
+ARIA2C_CONNS     = 16
+LOG_INTERVAL     = 8                   # seconds between live log lines
 TMP              = tempfile.mkdtemp(prefix='dl_')
-COOKIES_FILE     = f'{TMP}/cookies.txt'
 
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
       'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -53,7 +49,7 @@ HEADERS = {
 }
 
 # ══════════════════════════════════════════════════════════════
-# LOGGING — flush=True on every print for live GitHub Actions logs
+# LOGGING
 # ══════════════════════════════════════════════════════════════
 def log(msg=''):      print(msg, flush=True)
 def hr():             log('─' * 65)
@@ -66,7 +62,7 @@ def pct(done, total):
 def eta_str(done, total, elapsed):
     if not total or not done or not elapsed or done >= total:
         return ''
-    rem  = (total - done) / (done / elapsed)
+    rem = (total - done) / (done / elapsed)
     m, s = divmod(int(rem), 60)
     return f' ETA {m}m{s:02d}s' if m else f' ETA {s}s'
 
@@ -146,14 +142,8 @@ def referer(url: str) -> str:
 def is_magnet(url: str) -> bool:
     return url.strip().lower().startswith('magnet:')
 
-def file_size_ok(path: str, min_mb: float = 1.0) -> bool:
-    try:
-        return os.path.exists(path) and os.path.getsize(path) >= min_mb * 1024 * 1024
-    except OSError:
-        return False
-
 # ══════════════════════════════════════════════════════════════
-# URL RESOLVER — HEAD/GET to follow redirects, get filename+size
+# URL / MAGNET RESOLVER
 # ══════════════════════════════════════════════════════════════
 def resolve_url(url: str):
     log('  Resolving...')
@@ -185,119 +175,112 @@ def resolve_url(url: str):
     log(f'  Size : {fmt(size) if size else "unknown"}')
     return final, fname, size
 
+
+# ══════════════════════════════════════════════════════════════
+# GOFILE.IO HANDLER — auto-fetches guest token + direct URL
+# gofile requires a token cookie, raw URLs return empty files
+# ══════════════════════════════════════════════════════════════
+def resolve_gofile(url: str):
+    """
+    gofile.io download flow (updated for current API):
+    1. Create guest account -> get token
+    2. Extract content ID from URL
+    3. Try multiple API endpoints (gofile changes them frequently)
+    4. Fall back to direct download with auth headers if API fails
+    """
+    log('  gofile.io detected — fetching guest token...')
+
+    # Step 1: guest account token
+    r = SESSION.post('https://api.gofile.io/accounts',
+                     headers={'Content-Type': 'application/json'},
+                     timeout=15)
+    r.raise_for_status()
+    token = r.json()['data']['token']
+    log(f'  Token: {token[:10]}...')
+
+    # Step 2: extract content ID
+    m = re.search(r'/(?:d|download/web)/([a-f0-9-]{36})', url)
+    if not m:
+        raise ValueError(f'Cannot parse gofile content ID from: {url}')
+    cid = m.group(1)
+    log(f'  Content ID: {cid}')
+
+    auth_headers = {
+        'Authorization': f'Bearer {token}',
+        'Cookie':        f'accountToken={token}',
+        'Referer':       'https://gofile.io/',
+        'Origin':        'https://gofile.io',
+    }
+
+    # Step 3: try API endpoints (gofile changes wt token periodically)
+    info = None
+    api_attempts = [
+        f'https://api.gofile.io/contents/{cid}',
+        f'https://api.gofile.io/contents/{cid}?wt=4fd6sg89d7s6',
+        f'https://api.gofile.io/contents/{cid}?wt=7fd94ds12fds4',
+        f'https://api.gofile.io/getContent?contentId={cid}&token={token}',
+    ]
+    for api_url in api_attempts:
+        try:
+            r2 = SESSION.get(api_url, headers=auth_headers, timeout=15)
+            if r2.status_code == 200:
+                data = r2.json()
+                if data.get('status') == 'ok':
+                    info = data['data']
+                    log(f'  API OK: {api_url[:60]}')
+                    break
+            log(f'  API {r2.status_code}: {api_url[:60]}')
+        except Exception as e:
+            log(f'  API error: {e}')
+
+    # Step 4: API worked — parse file list
+    if info:
+        children = info.get('children', info.get('contents', {}))
+        if isinstance(children, dict):
+            files = [v for v in children.values()
+                     if isinstance(v, dict) and v.get('type') == 'file']
+        else:
+            files = []
+
+        # Maybe the content itself is a file
+        if not files and info.get('type') == 'file':
+            files = [info]
+
+        if files:
+            f     = max(files, key=lambda x: x.get('size', 0))
+            fname = sanitize(f.get('name', f'gofile_{cid[:8]}.mkv'))
+            size  = f.get('size', 0)
+            dl    = f.get('link', f.get('directLink', url))
+            log(f'  File : {fname}')
+            log(f'  Size : {fmt(size) if size else "unknown"}')
+            SESSION.headers.update(auth_headers)
+            return dl, fname, size, token
+
+    # Step 5: API failed entirely — download directly with auth headers
+    # The URL itself is a direct link, just needs the right cookies
+    log('  API unavailable — attempting direct download with auth headers')
+    path  = unquote(urlparse(url).path)
+    fname = sanitize(Path(path).name or f'gofile_{cid[:8]}.mkv')
+    SESSION.headers.update(auth_headers)
+    try:
+        r3   = SESSION.head(url, allow_redirects=True, timeout=20)
+        size = int(r3.headers.get('Content-Length', 0))
+    except Exception:
+        size = 0
+    log(f'  File : {fname}')
+    log(f'  Size : {fmt(size) if size else "unknown"}')
+    return url, fname, size, token
+
 def resolve_magnet(url: str) -> str:
-    m     = re.search(r'[?&]dn=([^&]+)', url)
+    m = re.search(r'[?&]dn=([^&]+)', url)
     fname = sanitize(unquote(m.group(1).replace('+', ' '))) if m else f'torrent_{int(time.time())}'
     log(f'  Magnet : {fname}')
     return fname
 
 # ══════════════════════════════════════════════════════════════
-# YT-DLP URL EXTRACTOR
-# Runs yt-dlp in extract-only mode to get:
-#   - Real CDN download URL
-#   - Filename
-#   - File size
-#   - Cookies (saved to file for aria2c)
-# Works for: gofile, Cloudflare sites, streaming sites, DDL hosts
-# ══════════════════════════════════════════════════════════════
-def ytdlp_extract(url: str) -> dict | None:
-    """
-    Returns dict with keys: url, filename, filesize, headers, cookies_file
-    Returns None if yt-dlp can't extract a direct URL.
-    """
-    log('  yt-dlp extracting real CDN URL...')
-
-    # Get JSON metadata — filename, url, filesize, http headers
-    cmd = [
-        'yt-dlp',
-        '--no-playlist', '--no-warnings',
-        '--dump-json',                     # output metadata as JSON
-        '--no-download',                   # don't actually download
-        '--user-agent', UA,
-        '--no-check-certificate',
-        '--cookies', COOKIES_FILE,         # save session cookies
-        '--extractor-args', 'generic:impersonate',
-        url
-    ]
-    try:
-        env = {**os.environ, 'PYTHONUNBUFFERED': '1'}
-        r   = subprocess.run(cmd, capture_output=True, text=True,
-                             timeout=90, env=env)
-        if r.returncode != 0 or not r.stdout.strip():
-            log(f'  yt-dlp extract failed: {r.stderr[-300:].strip()}')
-            return None
-
-        # yt-dlp may output multiple JSON objects (playlist) — take last
-        lines = [l for l in r.stdout.strip().splitlines() if l.startswith('{')]
-        if not lines:
-            return None
-
-        info = json.loads(lines[-1])
-
-        # Get the best format URL
-        direct_url = None
-        filename   = None
-        filesize   = 0
-        http_hdrs  = {}
-
-        # Try formats list first (for sites with multiple qualities)
-        formats = info.get('formats', [])
-        if formats:
-            # Pick best quality (last format is usually best)
-            best = formats[-1]
-            direct_url = best.get('url', '')
-            filesize   = best.get('filesize') or best.get('filesize_approx') or 0
-            http_hdrs  = best.get('http_headers', {})
-        
-        # Fall back to top-level url
-        if not direct_url:
-            direct_url = info.get('url', '')
-            filesize   = info.get('filesize') or info.get('filesize_approx') or 0
-            http_hdrs  = info.get('http_headers', {})
-
-        if not direct_url or not direct_url.startswith('http'):
-            log('  yt-dlp: no direct URL in metadata')
-            return None
-
-        # Get filename
-        filename = (
-            info.get('filename') or
-            info.get('_filename') or
-            info.get('title', '')
-        )
-        ext = info.get('ext', 'mkv')
-        if filename and not Path(filename).suffix:
-            filename = f'{filename}.{ext}'
-        if not filename:
-            filename = f'{info.get("id", "file")}.{ext}'
-        filename = sanitize(Path(filename).name)
-
-        log(f'  Extracted: {filename}')
-        log(f'  CDN URL  : {direct_url[:80]}')
-        log(f'  Size     : {fmt(filesize) if filesize else "unknown"}')
-
-        return {
-            'url':          direct_url,
-            'filename':     filename,
-            'filesize':     filesize,
-            'headers':      http_hdrs,
-            'cookies_file': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
-        }
-
-    except json.JSONDecodeError as e:
-        log(f'  yt-dlp JSON parse error: {e}')
-        return None
-    except subprocess.TimeoutExpired:
-        log('  yt-dlp extract timed out (90s)')
-        return None
-    except Exception as e:
-        log(f'  yt-dlp extract error: {e}')
-        return None
-
-# ══════════════════════════════════════════════════════════════
 # PROGRESS MONITOR — background thread, logs every N seconds
-# Separate thread so it never blocks the download process.
-# This is how we get truly live logs from aria2c in GitHub Actions.
+# Runs in a daemon thread so it doesn't block anything.
+# This is how we get truly live logs in GitHub Actions.
 # ══════════════════════════════════════════════════════════════
 class ProgressMonitor:
     def __init__(self, path, total_size, label, interval=LOG_INTERVAL):
@@ -334,7 +317,7 @@ class ProgressMonitor:
                     cur = os.path.getsize(self.path)
                     e   = now - self._t0
                     if cur > 0 and e > 0:
-                        p     = pct(cur, self.total)
+                        p = pct(cur, self.total)
                         e_str = eta_str(cur, self.total, e)
                         log(f'  ↳ {self.label} | {p} | {fmt(cur)} | {spd(cur/e)}{e_str}')
                 except OSError:
@@ -343,53 +326,8 @@ class ProgressMonitor:
             time.sleep(1)
 
 # ══════════════════════════════════════════════════════════════
-# ARIA2C RUNNER — shared by multiple methods
-# ══════════════════════════════════════════════════════════════
-def run_aria2c(url: str, out: str, fname: str, size: int,
-               extra_headers: list = None,
-               cookies_file: str = None,
-               label: str = None) -> bool:
-    """
-    Run aria2c with 16 connections. Returns True if file downloaded OK.
-    extra_headers: list of 'Key: Value' strings
-    cookies_file: path to Netscape cookies.txt
-    """
-    label = label or f'aria2c  {fname[:40]}'
-    cmd   = [
-        'aria2c', url,
-        '--dir', TMP, '--out', fname,
-        f'-x{ARIA2C_CONNS}', f'-s{ARIA2C_CONNS}',
-        '-k1M', '--min-split-size=1M',
-        '--max-tries=5', '--retry-wait=3',
-        '--connect-timeout=20', '--timeout=180',
-        '--continue=true', '--auto-file-renaming=false',
-        '--file-allocation=none', '--allow-overwrite=true',
-        '--console-log-level=error', '--summary-interval=0',
-        f'--user-agent={UA}',
-        '--header=Accept: */*',
-        '--header=Accept-Encoding: identity',
-        f'--header=Referer: {referer(url)}',
-    ]
-    if extra_headers:
-        for h in extra_headers:
-            cmd += [f'--header={h}']
-    if cookies_file and os.path.exists(cookies_file):
-        cmd += ['--load-cookies', cookies_file]
-
-    mon  = ProgressMonitor(out, size, label).start()
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    proc.wait()
-    mon.stop()
-
-    stderr = proc.stderr.read().decode(errors='ignore').strip()
-    if not file_size_ok(out):
-        if stderr:
-            log(f'  aria2c error: {stderr[-400:]}')
-        return False
-    return True
-
-# ══════════════════════════════════════════════════════════════
 # STREAMING UPLOAD — 512MB RAM chunks, resumable Drive API
+# No disk needed for upload. Handles any file size.
 # ══════════════════════════════════════════════════════════════
 class StreamUploader:
     def __init__(self, folder_id, fname, total_size):
@@ -436,6 +374,7 @@ class StreamUploader:
                 time.sleep(wait)
 
     def upload_file(self, path: str):
+        """Upload from disk — used after aria2c/torrent downloads."""
         self.total_size = os.path.getsize(path)
         self._start()
         uploaded = 0; t0 = time.time(); last_log = 0
@@ -458,6 +397,7 @@ class StreamUploader:
         log(f'  ↳ GDrive  | done | {fmt(uploaded)} | avg {spd(uploaded/e)}')
 
     def upload_stream(self, gen):
+        """Upload from generator — zero disk, for streaming methods."""
         self._start()
         buf = b''; uploaded = 0
         t0 = time.time(); last_log = 0
@@ -483,67 +423,111 @@ class StreamUploader:
         log(f'  ↳ GDrive  | done | {fmt(uploaded)} | avg {spd(uploaded/e)}')
         return uploaded
 
-# ══════════════════════════════════════════════════════════════
-# METHOD 1 — yt-dlp extract URL → aria2c 16 connections
-# THE FAST PATH for everything: gofile, Cloudflare, DDL hosts
-# yt-dlp resolves the real CDN URL + cookies in ~5 seconds
-# aria2c then downloads at full 16-connection speed
-# ══════════════════════════════════════════════════════════════
-def try_ytdlp_aria2c(url, fname, size, uploader) -> bool:
-    log('  [1/6] yt-dlp → aria2c (extract URL + 16 connections)')
 
-    extracted = ytdlp_extract(url)
-    if not extracted:
-        log('  yt-dlp could not extract direct URL')
+# ══════════════════════════════════════════════════════════════
+# METHOD 1b — gofile via yt-dlp URL extraction + aria2c download
+# yt-dlp resolves the real direct URL + token, aria2c downloads
+# at 16 connections for full speed instead of yt-dlp's single thread
+# ══════════════════════════════════════════════════════════════
+def try_gofile_fast(url, fname, size, uploader) -> bool:
+    log('  [1/5] gofile fast — yt-dlp extract URL + aria2c 16 connections')
+
+    # Step 1: use yt-dlp to extract the real direct URL + cookies
+    extract_cmd = [
+        'yt-dlp', '--no-playlist', '--no-warnings',
+        '--get-url',           # just print the download URL, don't download
+        '--user-agent', UA,
+        '--no-check-certificate',
+        url
+    ]
+    try:
+        r = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=60)
+        direct_url = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ''
+        if not direct_url or not direct_url.startswith('http'):
+            log(f'  yt-dlp URL extraction failed: {r.stderr[:200]}')
+            return False
+        log(f'  Extracted URL: {direct_url[:80]}')
+    except Exception as e:
+        log(f'  URL extraction error: {e}')
         return False
 
-    real_url   = extracted['url']
-    real_fname = extracted['filename'] or fname
-    real_size  = extracted['filesize'] or size
-    cookies    = extracted['cookies_file']
+    # Step 2: also extract cookies yt-dlp used
+    cookie_cmd = [
+        'yt-dlp', '--no-playlist', '--no-warnings',
+        '--cookies', f'{TMP}/gofile_cookies.txt',
+        '--skip-download',     # don't download, just save cookies
+        '--user-agent', UA,
+        url
+    ]
+    subprocess.run(cookie_cmd, capture_output=True, timeout=60)
 
-    # Build extra headers from yt-dlp metadata
-    extra_headers = []
-    for k, v in extracted.get('headers', {}).items():
-        if k.lower() not in ('user-agent', 'accept-encoding'):
-            extra_headers.append(f'{k}: {v}')
+    # Step 3: aria2c with 16 connections on the real URL
+    out = f'{TMP}/{fname}'
+    cmd = [
+        'aria2c', direct_url,
+        '--dir', TMP, '--out', fname,
+        f'-x{ARIA2C_CONNS}', f'-s{ARIA2C_CONNS}',
+        '-k1M', '--min-split-size=1M',
+        '--max-tries=5', '--retry-wait=3',
+        '--connect-timeout=20', '--timeout=180',
+        '--continue=true', '--auto-file-renaming=false',
+        '--file-allocation=none', '--allow-overwrite=true',
+        '--console-log-level=error', '--summary-interval=0',
+        f'--user-agent={UA}',
+        '--header=Accept: */*',
+        '--header=Accept-Encoding: identity',
+        '--header=Referer: https://gofile.io/',
+        '--header=Origin: https://gofile.io',
+    ]
+    # Add cookies file if it was created
+    cookies_path = f'{TMP}/gofile_cookies.txt'
+    if os.path.exists(cookies_path):
+        cmd += ['--load-cookies', cookies_path]
 
-    # Update uploader with real filename if different
-    if real_fname and real_fname != fname:
-        log(f'  Using extracted filename: {real_fname}')
-        uploader.fname = real_fname
-
-    out = f'{TMP}/{real_fname}'
-
-    ok = run_aria2c(
-        real_url, out, real_fname, real_size,
-        extra_headers=extra_headers,
-        cookies_file=cookies,
-        label=f'fast    {real_fname[:40]}'
-    )
-
-    if not ok:
-        log('  aria2c failed on extracted URL')
+    mon  = ProgressMonitor(out, size, f'gofile  {fname[:40]}').start()
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    proc.wait()
+    mon.stop()
+    stderr = proc.stderr.read().decode(errors='ignore').strip()
+    if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 1024*1024:
+        if stderr: log(f'  aria2c error: {stderr[-300:]}')
+        log('  gofile fast failed — falling back to yt-dlp single thread')
         return False
-
-    actual_size = os.path.getsize(out)
-    log(f'  Download done: {fmt(actual_size)}')
-    uploader.total_size = actual_size
+    log(f'  gofile fast done: {fmt(os.path.getsize(out))}')
     uploader.upload_file(out)
     try: os.remove(out)
     except: pass
     return True
 
 # ══════════════════════════════════════════════════════════════
-# METHOD 2 — aria2c direct HTTP
-# For plain servers where yt-dlp extraction isn't needed
+# METHOD 1 — aria2c HTTP/HTTPS
 # ══════════════════════════════════════════════════════════════
 def try_aria2c(url, fname, size, uploader) -> bool:
-    log('  [2/6] aria2c direct HTTP — 16 connections')
+    log('  [1/5] aria2c HTTP — 16 connections, 1MB splits')
     out = f'{TMP}/{fname}'
-    ok  = run_aria2c(url, out, fname, size,
-                     label=f'aria2c  {fname[:40]}')
-    if not ok:
+    cmd = [
+        'aria2c', url,
+        '--dir', TMP, '--out', fname,
+        f'-x{ARIA2C_CONNS}', f'-s{ARIA2C_CONNS}',
+        '-k1M', '--min-split-size=1M',
+        '--max-tries=5', '--retry-wait=3',
+        '--connect-timeout=20', '--timeout=120',
+        '--continue=true', '--auto-file-renaming=false',
+        '--file-allocation=none', '--allow-overwrite=true',
+        '--console-log-level=error', '--summary-interval=0',
+        f'--user-agent={UA}',
+        '--header=Accept: */*',
+        '--header=Accept-Encoding: identity',
+        f'--header=Referer: {referer(url)}',
+    ]
+    mon  = ProgressMonitor(out, size, f'aria2c  {fname[:40]}').start()
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    proc.wait()
+    mon.stop()
+    stderr = proc.stderr.read().decode(errors='ignore').strip()
+    if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 1024*1024:
+        if stderr: log(f'  aria2c error: {stderr[-400:]}')
+        log(f'  aria2c: file too small ({fmt(os.path.getsize(out) if os.path.exists(out) else 0)}) — likely auth required or empty response')
         return False
     log(f'  aria2c done: {fmt(os.path.getsize(out))}')
     uploader.upload_file(out)
@@ -552,11 +536,10 @@ def try_aria2c(url, fname, size, uploader) -> bool:
     return True
 
 # ══════════════════════════════════════════════════════════════
-# METHOD 3 — aria2c Magnet/Torrent
-# BitTorrent protocol for magnet: links
+# METHOD 2 — aria2c MAGNET/TORRENT
 # ══════════════════════════════════════════════════════════════
 def try_magnet(url, fname, size, uploader) -> bool:
-    log('  [3/6] aria2c Magnet — BitTorrent, finding peers...')
+    log('  [2/5] aria2c Magnet — BitTorrent, finding peers...')
     cmd = [
         'aria2c', url,
         '--dir', TMP,
@@ -575,23 +558,22 @@ def try_magnet(url, fname, size, uploader) -> bool:
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-    # Poll until torrent resolves and starts creating a file
-    t0 = time.time(); mon = None; last_wait = 0
+    # Wait for aria2c to resolve the magnet and start creating a file
+    t0 = time.time(); mon = None
     while proc.poll() is None:
         candidates = [p for p in Path(TMP).iterdir()
                       if p.is_file() and not p.name.endswith('.aria2')
                       and p.stat().st_size > 0]
         if candidates:
             found = max(candidates, key=lambda p: p.stat().st_size)
-            uploader.fname = found.name
-            mon = ProgressMonitor(str(found), size,
-                                  f'torrent {found.name[:40]}').start()
-            log(f'  Resolved: {found.name}')
+            fname = found.name
+            uploader.fname = fname
+            mon = ProgressMonitor(str(found), size, f'torrent {fname[:40]}').start()
+            log(f'  Resolved: {fname}')
             break
-        now = time.time()
-        if now - last_wait >= 30:
-            log(f'  Waiting for peers... ({int(now-t0)}s)')
-            last_wait = now
+        elapsed = time.time() - t0
+        if elapsed > 30 and int(elapsed) % 30 == 0:
+            log(f'  Waiting for peers... ({int(elapsed)}s)')
         time.sleep(2)
 
     proc.wait()
@@ -603,7 +585,7 @@ def try_magnet(url, fname, size, uploader) -> bool:
          if p.is_file() and not p.name.endswith('.aria2')],
         key=lambda p: p.stat().st_size, reverse=True
     )
-    if not candidates or candidates[0].stat().st_size < 1024 * 1024:
+    if not candidates or candidates[0].stat().st_size < 1024:
         if stderr: log(f'  Magnet error: {stderr[-400:]}')
         return False
 
@@ -617,11 +599,10 @@ def try_magnet(url, fname, size, uploader) -> bool:
     return True
 
 # ══════════════════════════════════════════════════════════════
-# METHOD 4 — yt-dlp full download (single thread)
-# Fallback when URL extraction works but aria2c fails
+# METHOD 3 — yt-dlp + curl_cffi (Cloudflare bypass)
 # ══════════════════════════════════════════════════════════════
 def try_ytdlp(url, fname, size, uploader) -> bool:
-    log('  [4/6] yt-dlp full download (single thread)')
+    log('  [3/5] yt-dlp + curl_cffi (Cloudflare bypass)')
     stem     = Path(fname).stem
     out_tmpl = f'{TMP}/{stem}.%(ext)s'
     cmd = [
@@ -634,7 +615,6 @@ def try_ytdlp(url, fname, size, uploader) -> bool:
         '--retries', '5', '--fragment-retries', '5',
         '--concurrent-fragments', '16',
         '--no-check-certificate',
-        '--cookies', COOKIES_FILE,
         '--extractor-args', 'generic:impersonate',
         '--newline', url
     ]
@@ -666,23 +646,21 @@ def try_ytdlp(url, fname, size, uploader) -> bool:
 
     candidates = sorted(Path(TMP).glob(f'{stem}.*'),
                         key=lambda p: p.stat().st_size, reverse=True)
-    if not candidates or candidates[0].stat().st_size < 1024 * 1024:
-        log(f'  yt-dlp failed (code {proc.returncode})')
+    if not candidates or candidates[0].stat().st_size < 1024*1024:
+        log(f'  yt-dlp failed (code {proc.returncode}) — empty or too small')
         return False
     out = str(candidates[0])
     log(f'  yt-dlp done: {fmt(os.path.getsize(out))}')
-    uploader.fname = candidates[0].name
     uploader.upload_file(out)
     try: os.remove(out)
     except: pass
     return True
 
 # ══════════════════════════════════════════════════════════════
-# METHOD 5 — curl_cffi (Chrome TLS fingerprint)
-# For Cloudflare-protected sites that block everything else
+# METHOD 4 — curl_cffi (Chrome TLS fingerprint)
 # ══════════════════════════════════════════════════════════════
 def try_curl_cffi(url, fname, size, uploader) -> bool:
-    log('  [5/6] curl_cffi (Chrome TLS fingerprint)')
+    log('  [4/5] curl_cffi (Chrome TLS fingerprint)')
     try:
         from curl_cffi import requests as cffi_req
     except ImportError:
@@ -713,8 +691,8 @@ def try_curl_cffi(url, fname, size, uploader) -> bool:
         except: pass
         return False
 
-    if not file_size_ok(out):
-        log('  curl_cffi: file too small')
+    if not os.path.exists(out) or os.path.getsize(out) < 1024*1024:
+        log('  curl_cffi: file too small — likely auth required or empty response')
         return False
     log(f'  curl_cffi done: {fmt(os.path.getsize(out))}')
     uploader.upload_file(out)
@@ -723,10 +701,10 @@ def try_curl_cffi(url, fname, size, uploader) -> bool:
     return True
 
 # ══════════════════════════════════════════════════════════════
-# METHOD 6 — requests stream (last resort)
+# METHOD 5 — requests stream (plain fallback)
 # ══════════════════════════════════════════════════════════════
 def try_requests(url, fname, size, uploader) -> bool:
-    log('  [6/6] requests stream (plain HTTP fallback)')
+    log('  [5/5] requests stream (plain HTTP fallback)')
     t0 = time.time(); last_log = [0]
 
     def gen():
@@ -764,35 +742,35 @@ def process(url: str, drive, folder_id: str):
     try:
         magnet = is_magnet(url)
 
+        magnet  = is_magnet(url)
+        gofile  = 'gofile.io' in url
+
         if magnet:
             fname = resolve_magnet(url)
             size  = 0
             final = url
+        elif gofile:
+            final, fname, size, _token = resolve_gofile(url)
         else:
             final, fname, size = resolve_url(url)
-            if file_exists(drive, folder_id, fname, size):
-                log('  ✓ Already on GDrive — skipping')
-                return
+
+        if not magnet and file_exists(drive, folder_id, fname, size):
+            log('  ✓ Already on GDrive — skipping')
+            return
 
         uploader = StreamUploader(folder_id, fname, size)
         t0       = time.time()
-
         if magnet:
             methods = [try_magnet]
+        elif gofile:
+            # gofile fast: yt-dlp extracts real URL, aria2c downloads at 16x speed
+            # falls back to yt-dlp single thread if aria2c fails
+            methods = [try_gofile_fast, try_ytdlp, try_curl_cffi, try_requests]
         else:
-            # yt-dlp→aria2c is method 1 for ALL urls:
-            # handles gofile, cloudflare, DDL, streaming sites
-            # aria2c direct is method 2 for plain HTTP servers
-            methods = [
-                try_ytdlp_aria2c,   # fast path: extract URL + 16 connections
-                try_aria2c,         # direct aria2c (plain servers)
-                try_ytdlp,          # yt-dlp single thread fallback
-                try_curl_cffi,      # chrome TLS fingerprint
-                try_requests,       # plain HTTP last resort
-            ]
+            methods = [try_aria2c, try_ytdlp, try_curl_cffi, try_requests]
 
         for fn in methods:
-            stem = Path(uploader.fname).stem
+            stem = Path(fname).stem
             for p in Path(TMP).glob(f'{stem}*'):
                 try: p.unlink()
                 except: pass
@@ -830,14 +808,9 @@ def main():
     log('=' * 65)
     log(f'  GDrive Downloader — {len(urls)} file(s)')
     log(f'  Folder  : {GDRIVE_FOLDER_ID}')
-    log(f'  Method 1: yt-dlp extract URL → aria2c 16 connections')
-    log(f'  Method 2: aria2c direct HTTP')
-    log(f'  Method 3: aria2c Magnet/Torrent')
-    log(f'  Method 4: yt-dlp full download')
-    log(f'  Method 5: curl_cffi Chrome TLS')
-    log(f'  Method 6: requests stream')
+    log(f'  Methods : aria2c | torrent | yt-dlp | cffi | requests')
     log(f'  Upload  : 512MB chunks, resumable API')
-    log(f'  Logs    : live every {LOG_INTERVAL}s')
+    log(f'  Logs    : live, every {LOG_INTERVAL}s')
     log('=' * 65)
 
     for key in ('GDRIVE_CLIENT_ID', 'GDRIVE_CLIENT_SECRET', 'GDRIVE_REFRESH_TOKEN'):
