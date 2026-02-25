@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'URLs to download (comma or newline separated)'
+        description: 'URLs or magnet links (comma or newline separated)'
         required: true
         type: string
 
@@ -12,6 +12,8 @@ jobs:
   download:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout
@@ -21,14 +23,15 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2 curl
+
           pip install -q \
             yt-dlp \
             curl_cffi \
             google-api-python-client \
             google-auth-oauthlib \
             google-auth \
-            tqdm \
-            requests
+            requests \
+            mega.py          # Mega.nz API — bypasses Azure CDN IP blocks
 
       - name: Run downloader
         env:
@@ -36,4 +39,4 @@ jobs:
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
           DOWNLOAD_URLS:        ${{ inputs.urls }}
-        run: python download.py
+        run: python -u download.py
