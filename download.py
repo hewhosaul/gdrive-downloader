@@ -3,14 +3,13 @@
 GDrive Downloader — GitHub Actions
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Download waterfall:
-  1. aria2c     — 16 connections, 1MB splits (no tail slowdown)
+  0. mega.py    — for mega.nz / mega.co.nz / userstorage.mega URLs
+  1. aria2c     — 16 connections, 1MB splits (fastest for open CDNs)
   2. yt-dlp     — curl_cffi impersonation, bypasses Cloudflare
   3. curl_cffi  — browser TLS fingerprint
   4. requests   — plain fallback
 
-Upload:
-  Primary  : rclone → Drive (config written from env vars at runtime)
-  Fallback : StreamUploader → OAuth resumable API (always works)
+Upload: OAuth resumable Drive API, 256MB chunks, no rclone
 """
 
 import os, sys, re, time, json, subprocess, tempfile
@@ -27,13 +26,10 @@ from googleapiclient.discovery import build
 # ══════════════════════════════════════════════════════════════════
 GDRIVE_FOLDER_ID = '1TRND8VlWi0U7wdHk3HLJ7hvzOw90PDE3'
 
-UPLOAD_CHUNK  = 256 * 1024 * 1024   # 256MB per PUT — sweet spot for Drive API
-DL_CHUNK      = 16  * 1024 * 1024   # 16MB read buffer for disk→upload
-ARIA2C_CONNS  = 16
-TMP           = tempfile.mkdtemp(prefix='dl_')
-
-RCLONE_REMOTE = 'gdrive'
-RCLONE_CONFIG  = f'{TMP}/rclone.conf'
+UPLOAD_CHUNK = 256 * 1024 * 1024   # 256MB per PUT — sweet spot for Drive API
+DL_CHUNK     = 16  * 1024 * 1024   # 16MB read buffer
+ARIA2C_CONNS = 16
+TMP          = tempfile.mkdtemp(prefix='dl_')
 
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
       'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -59,10 +55,10 @@ def sanitize(name: str) -> str:
     return name[:200].strip() or f'file_{int(time.time())}'
 
 def clean_url(u: str) -> str:
-    """Strip backslash escapes zsh adds to ? & = in URLs."""
+    """Strip zsh backslash-escapes from ? & = in URLs."""
     return u.replace('\\?', '?').replace('\\&', '&').replace('\\=', '=')
 
-def referer(url):
+def referer(url: str) -> str:
     p = urlparse(url)
     return f'{p.scheme}://{p.netloc}/'
 
@@ -156,89 +152,7 @@ def resolve_url(url: str):
     return final, fname, size
 
 # ══════════════════════════════════════════════════════════════════
-# RCLONE UPLOAD — primary upload path
-# Config is written from env vars at runtime — no rclone.conf in repo
-# ══════════════════════════════════════════════════════════════════
-_rclone_ok = None
-
-def setup_rclone() -> bool:
-    """Write rclone.conf from env vars. Returns True on success."""
-    client_id     = os.environ.get('GDRIVE_CLIENT_ID', '')
-    client_secret = os.environ.get('GDRIVE_CLIENT_SECRET', '')
-    refresh_token = os.environ.get('GDRIVE_REFRESH_TOKEN', '')
-    if not all([client_id, client_secret, refresh_token]):
-        return False
-    config = (
-        f'[{RCLONE_REMOTE}]\n'
-        f'type = drive\n'
-        f'client_id = {client_id}\n'
-        f'client_secret = {client_secret}\n'
-        f'token = {{"access_token":"","token_type":"Bearer",'
-        f'"refresh_token":"{refresh_token}",'
-        f'"expiry":"2000-01-01T00:00:00Z"}}\n'
-        f'scope = drive\n'
-        f'root_folder_id = {GDRIVE_FOLDER_ID}\n'
-    )
-    with open(RCLONE_CONFIG, 'w') as f:
-        f.write(config)
-    os.chmod(RCLONE_CONFIG, 0o600)
-    return True
-
-def rclone_available() -> bool:
-    global _rclone_ok
-    if _rclone_ok is not None:
-        return _rclone_ok
-    try:
-        r = subprocess.run(['rclone', 'version'], capture_output=True, timeout=10)
-        _rclone_ok = (r.returncode == 0) and setup_rclone()
-    except Exception:
-        _rclone_ok = False
-    log(f'  rclone available: {_rclone_ok}')
-    return _rclone_ok
-
-def rclone_upload(path: str, fname: str) -> bool:
-    """Upload file via rclone. Returns True on success."""
-    size = os.path.getsize(path)
-    log(f'  Uploading {fmt(size)} via rclone...')
-    cmd = [
-        'rclone', 'copyto',
-        path,
-        f'{RCLONE_REMOTE}:{fname}',
-        '--config',              RCLONE_CONFIG,
-        '--drive-chunk-size',    '512M',
-        '--drive-upload-cutoff', '512M',
-        '--retries',             '5',
-        '--retries-sleep',       '5s',
-        '--low-level-retries',   '10',
-        '--stats',               '8s',
-        '--stats-one-line',
-        '--stats-log-level',     'NOTICE',
-        '--use-mmap',
-        '-v',
-    ]
-    t0   = time.time()
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1
-    )
-    for line in proc.stdout:
-        line = line.strip()
-        if not line:
-            continue
-        if any(x in line for x in ('Transferred:', 'ETA', 'ERROR', 'error',
-                                    'failed', 'Fatal', 'unknown', 'flag')):
-            log(f'  ↳ rclone | {line}')
-    proc.wait()
-    e = time.time() - t0
-    if proc.returncode != 0:
-        log(f'  rclone failed (exit {proc.returncode}) — falling back to API')
-        return False
-    log(f'  ↳ rclone | done | {fmt(size)} | avg {spd(size/e) if e else "?"}')
-    return True
-
-# ══════════════════════════════════════════════════════════════════
-# STREAMING UPLOAD — 512MB RAM chunks → Drive API resumable
-# Fallback when rclone is unavailable or fails
+# UPLOAD — OAuth resumable Drive API, 256MB chunks
 # ══════════════════════════════════════════════════════════════════
 class StreamUploader:
     def __init__(self, folder_id, fname, total_size):
@@ -288,7 +202,7 @@ class StreamUploader:
                 time.sleep(wait)
 
     def run_file(self, path: str):
-        """Upload a file directly — no intermediate buffer, reads in UPLOAD_CHUNK blocks."""
+        """Upload from disk — 256MB direct reads, no intermediate buffer."""
         self.total_size = os.path.getsize(path)
         self._start()
         uploaded = 0; t0 = time.time(); last_log = 0
@@ -304,48 +218,18 @@ class StreamUploader:
                 now = time.time()
                 if now - last_log >= 8:
                     e = now - t0
-                    pct = f'{uploaded*100//self.total_size}%' if self.total_size else '?'
-                    log(f'  ↳ GDrive | {pct} | {fmt(uploaded)} | {spd(uploaded/e)}')
+                    pct = f'{uploaded*100//self.total_size}%'
+                    log(f'  ↳ {pct} | {fmt(uploaded)} | {spd(uploaded/e)}')
                     last_log = now
         e = time.time() - t0
-        log(f'  ↳ GDrive | done | {fmt(uploaded)} | avg {spd(uploaded/e)}')
+        log(f'  ↳ done | {fmt(uploaded)} | avg {spd(uploaded/e)}')
         return uploaded
 
-    def run(self, stream_iter, bar_desc='Upload'):
-        """Legacy stream-based upload — kept for requests fallback method."""
-        self._start()
-        buf = b''; uploaded = 0; t0 = time.time(); last_log = 0
-        log(f'  Uploading to GDrive (streaming)...')
-        for chunk in stream_iter:
-            if not chunk: continue
-            buf += chunk
-            while len(buf) >= UPLOAD_CHUNK:
-                piece = buf[:UPLOAD_CHUNK]; buf = buf[UPLOAD_CHUNK:]
-                self._put_chunk(piece, uploaded, is_last=False)
-                uploaded += len(piece)
-                now = time.time()
-                if now - last_log >= 8:
-                    e = now - t0
-                    log(f'  ↳ GDrive | {fmt(uploaded)} | {spd(uploaded/e)}')
-                    last_log = now
-        if buf:
-            if not self.total_size:
-                self.total_size = uploaded + len(buf)
-            self._put_chunk(buf, uploaded, is_last=True)
-            uploaded += len(buf)
-        e = time.time() - t0
-        log(f'  ↳ GDrive | done | {fmt(uploaded)} | avg {spd(uploaded/e)}')
-        return uploaded
-
-# ══════════════════════════════════════════════════════════════════
-# UPLOAD — direct Drive API, 256MB chunks, plain progress logging
-# ══════════════════════════════════════════════════════════════════
 def upload_file(path: str, uploader: StreamUploader):
-    """Upload file to GDrive using resumable API with 256MB chunks."""
     uploader.run_file(path)
 
 # ══════════════════════════════════════════════════════════════════
-# PROGRESS BAR POLLER
+# PROGRESS POLLER — logs every 8s while subprocess runs
 # ══════════════════════════════════════════════════════════════════
 def poll_bar(proc, out_path, size, desc):
     t0 = time.time(); prev = 0; last_log = 0
@@ -362,23 +246,73 @@ def poll_bar(proc, out_path, size, desc):
         time.sleep(1)
     try:
         cur = os.path.getsize(out_path)
-        e = time.time() - t0
+        e   = time.time() - t0
         if e and cur:
             log(f'  ↳ {desc} | done | {fmt(cur)} | avg {spd(cur/e)}')
-    except OSError: pass
+    except OSError:
+        pass
 
 # ══════════════════════════════════════════════════════════════════
-# METHOD 1 — aria2c (16 connections, 1MB splits)
+# METHOD 0 — mega.py (ALL Mega URLs)
+#
+# Mega's CDN (userstorage.mega.co.nz) blocks Azure/datacenter IPs
+# on plain HTTP — every method gets 403. mega.py works because it
+# talks to Mega's API (g.api.mega.co.nz) which is not IP-restricted,
+# gets a fresh temp download token + encryption key, then downloads
+# from a different CDN slot. Decryption is done client-side.
+# Works for: mega.nz/#!xxx share links AND raw userstorage CDN URLs.
+# ══════════════════════════════════════════════════════════════════
+def is_mega_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return any(x in host for x in ('mega.nz', 'mega.co.nz', 'mega.io'))
+
+def try_mega(url, fname, size, uploader) -> bool:
+    log('  [0] mega.py — Mega encrypted API download')
+    try:
+        from mega import Mega
+    except ImportError:
+        log('  mega.py not installed — skipping (add "mega.py" to pip install in workflow)')
+        return False
+
+    try:
+        m = Mega()
+        m.login()  # anonymous — no account needed for public links
+        log('  Mega anonymous login OK')
+        log(f'  Downloading via Mega API...')
+        t0 = time.time()
+
+        # download_url returns the local path where the file was saved
+        out_path = m.download_url(url, dest_path=TMP, dest_filename=None)
+
+        if not out_path or not Path(str(out_path)).exists():
+            log('  mega.py returned no output path')
+            return False
+
+        out_path    = str(out_path)
+        actual_size = os.path.getsize(out_path)
+        e           = time.time() - t0
+        log(f'  Mega done: {fmt(actual_size)} in {e:.0f}s ({spd(actual_size/e)})')
+
+        uploader.fname = sanitize(Path(out_path).name)
+        upload_file(out_path, uploader)
+        try: os.remove(out_path)
+        except: pass
+        return True
+
+    except Exception as e:
+        log(f'  mega.py failed: {e}')
+        return False
+
+# ══════════════════════════════════════════════════════════════════
+# METHOD 1 — aria2c (fastest for open/CDN servers)
 # ══════════════════════════════════════════════════════════════════
 def try_aria2c(url, fname, size, uploader) -> bool:
     log('  [1/4] aria2c — 16 connections, 1MB splits')
     out = f'{TMP}/{fname}'
     cmd = [
         'aria2c', url, '--dir', TMP, '--out', fname,
-        f'-x{ARIA2C_CONNS}',
-        f'-s{ARIA2C_CONNS}',
-        '-k1M',
-        '--min-split-size=1M',
+        f'-x{ARIA2C_CONNS}', f'-s{ARIA2C_CONNS}',
+        '-k1M', '--min-split-size=1M',
         '--max-tries=5', '--retry-wait=3',
         '--connect-timeout=20', '--timeout=120',
         '--continue=true', '--auto-file-renaming=false',
@@ -391,14 +325,13 @@ def try_aria2c(url, fname, size, uploader) -> bool:
         f'--header=Referer: {referer(url)}',
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    poll_bar(proc, out, size, f'aria2c  {fname[:35]}')
+    poll_bar(proc, out, size, 'aria2c')
     proc.wait()
     stderr = proc.stderr.read().decode(errors='ignore').strip()
     if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 10000:
         log(f'  aria2c failed (code {proc.returncode}): {stderr[-300:]}')
         return False
     log(f'  aria2c done: {fmt(os.path.getsize(out))}')
-    log('  Uploading to GDrive...')
     upload_file(out, uploader)
     try: os.remove(out)
     except: pass
@@ -425,15 +358,12 @@ def try_ytdlp(url, fname, size, uploader) -> bool:
         '--progress', '--newline',
         url
     ]
-    t0   = time.time()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, bufsize=1)
     for line in proc.stdout:
         line = line.strip()
-        if line and '[download]' in line:
+        if line:
             log(f'  {line}')
-        elif line and '[download]' not in line:
-            log(f'    {line}')
     proc.wait()
     candidates = sorted(Path(TMP).glob(f'{stem}.*'),
                         key=lambda p: p.stat().st_size, reverse=True)
@@ -442,8 +372,7 @@ def try_ytdlp(url, fname, size, uploader) -> bool:
         return False
     out = str(candidates[0])
     log(f'  yt-dlp done: {fmt(os.path.getsize(out))}')
-    log('  Uploading to GDrive...')
-    uploader.fname = Path(out).name
+    uploader.fname = sanitize(Path(out).name)
     upload_file(out, uploader)
     try: os.remove(out)
     except: pass
@@ -465,8 +394,7 @@ def try_curl_cffi(url, fname, size, uploader) -> bool:
     t0 = time.time(); done = 0; last_log = 0
     try:
         r = cffi_req.get(url, stream=True, timeout=120,
-                         impersonate='chrome120',
-                         headers=COMMON_HEADERS)
+                         impersonate='chrome120', headers=COMMON_HEADERS)
         r.raise_for_status()
         with open(part, 'wb') as f:
             for chunk in r.iter_content(chunk_size=DL_CHUNK):
@@ -487,7 +415,6 @@ def try_curl_cffi(url, fname, size, uploader) -> bool:
         log('  curl_cffi produced empty file')
         return False
     log(f'  curl_cffi done: {fmt(os.path.getsize(out))}')
-    log('  Uploading to GDrive...')
     upload_file(out, uploader)
     try: os.remove(out)
     except: pass
@@ -523,7 +450,6 @@ def try_requests(url, fname, size, uploader) -> bool:
         log('  requests produced empty file')
         return False
     log(f'  requests done: {fmt(os.path.getsize(out))}')
-    log('  Uploading to GDrive...')
     upload_file(out, uploader)
     try: os.remove(out)
     except: pass
@@ -544,8 +470,15 @@ def process(url: str, drive, folder_id: str):
             log('  Already on GDrive — skipping')
             return
         uploader = StreamUploader(folder_id, fname, size)
-        t0 = time.time()
-        for fn in [try_aria2c, try_ytdlp, try_curl_cffi, try_requests]:
+        t0       = time.time()
+
+        # Mega CDN blocks datacenter IPs — must use mega.py first
+        if is_mega_url(final_url):
+            methods = [try_mega, try_aria2c, try_ytdlp, try_curl_cffi, try_requests]
+        else:
+            methods = [try_aria2c, try_ytdlp, try_curl_cffi, try_requests]
+
+        for fn in methods:
             for p in Path(TMP).glob(f'{Path(fname).stem}*'):
                 try: p.unlink()
                 except: pass
@@ -577,11 +510,12 @@ def main():
     log('=' * 65)
     log(f'  GDrive Downloader — {len(urls)} file(s)')
     log(f'  Folder  : {GDRIVE_FOLDER_ID}')
+    log(f'  Method 0: mega.py (Mega URLs — bypasses Azure block)')
     log(f'  Method 1: aria2c 16 connections, 1MB splits')
     log(f'  Method 2: yt-dlp + curl_cffi (Cloudflare bypass)')
     log(f'  Method 3: curl_cffi browser TLS')
     log(f'  Method 4: requests stream')
-    log(f'  Upload  : rclone (primary) → direct API (fallback)')
+    log(f'  Upload  : OAuth resumable API, 256MB chunks')
     log('=' * 65)
 
     for key in ('GDRIVE_CLIENT_ID', 'GDRIVE_CLIENT_SECRET', 'GDRIVE_REFRESH_TOKEN'):
