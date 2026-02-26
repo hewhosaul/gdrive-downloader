@@ -32,7 +32,7 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
           sudo apt-get update -qq
           sudo apt-get install -y -qq cloudflare-warp
-          sudo systemctl start warp-taskd
+          sudo systemctl start warp-svc
 
           pip install -q \
             yt-dlp \
