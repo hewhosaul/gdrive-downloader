@@ -455,9 +455,64 @@ def try_requests(url, fname, size, uploader) -> bool:
     except: pass
     return True
 
-# ══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
+# WARP VPN — Cloudflare WARP tunnel
+# Only activated after all direct methods fail.
+# Gives a Cloudflare IP which bypasses many datacenter/Azure blocks.
+# ════════════════════════════════════════════════════════════════
+_warp_connected = False
+
+def warp_available() -> bool:
+    try:
+        r = subprocess.run(['warp-cli', '--version'],
+                           capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def warp_connect() -> bool:
+    global _warp_connected
+    if _warp_connected:
+        return True
+    if not warp_available():
+        log('  WARP: warp-cli not found — skipping')
+        return False
+    try:
+        log('  WARP: registering...')
+        subprocess.run(['warp-cli', '--accept-tos', 'registration', 'new'],
+                       capture_output=True, timeout=30)
+        log('  WARP: connecting...')
+        subprocess.run(['warp-cli', '--accept-tos', 'connect'],
+                       capture_output=True, timeout=30)
+        for _ in range(15):
+            time.sleep(1)
+            r = subprocess.run(['warp-cli', 'status'],
+                               capture_output=True, text=True, timeout=5)
+            if 'Connected' in r.stdout:
+                log('  WARP: connected ✓')
+                _warp_connected = True
+                return True
+        log('  WARP: timed out waiting for connection')
+        return False
+    except Exception as e:
+        log(f'  WARP: connect failed: {e}')
+        return False
+
+def warp_disconnect():
+    global _warp_connected
+    if not _warp_connected:
+        return
+    try:
+        subprocess.run(['warp-cli', 'disconnect'],
+                       capture_output=True, timeout=10)
+        _warp_connected = False
+        log('  WARP: disconnected')
+    except Exception:
+        pass
+
+# ════════════════════════════════════════════════════════════════
 # ORCHESTRATOR
-# ══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
 def process(url: str, drive, folder_id: str):
     url = clean_url(url.strip())
     if not url or url.startswith('#'):
@@ -472,22 +527,42 @@ def process(url: str, drive, folder_id: str):
         uploader = StreamUploader(folder_id, fname, size)
         t0       = time.time()
 
-        # Mega CDN blocks datacenter IPs — must use mega.py first
         if is_mega_url(final_url):
             methods = [try_mega, try_aria2c, try_ytdlp, try_curl_cffi, try_requests]
         else:
             methods = [try_aria2c, try_ytdlp, try_curl_cffi, try_requests]
 
-        for fn in methods:
+        def _clean():
             for p in Path(TMP).glob(f'{Path(fname).stem}*'):
                 try: p.unlink()
                 except: pass
+
+        # Round 1: direct connection
+        log('  Round 1: direct')
+        for fn in methods:
+            _clean()
             try:
                 if fn(final_url, fname, size, uploader):
                     log(f'  Done in {(time.time()-t0)/60:.1f} min')
                     return
             except Exception as e:
                 log(f'  Error in {fn.__name__}: {e}')
+
+        # Round 2: via WARP (only if all direct attempts failed)
+        log('  All direct methods failed — activating WARP...')
+        if warp_connect():
+            log('  Round 2: retrying via WARP tunnel')
+            for fn in methods:
+                _clean()
+                try:
+                    if fn(final_url, fname, size, uploader):
+                        warp_disconnect()
+                        log(f'  Done in {(time.time()-t0)/60:.1f} min')
+                        return
+                except Exception as e:
+                    log(f'  Error in {fn.__name__} (WARP): {e}')
+            warp_disconnect()
+
         log(f'  FAILED — all methods exhausted for: {fname}')
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -510,12 +585,13 @@ def main():
     log('=' * 65)
     log(f'  GDrive Downloader — {len(urls)} file(s)')
     log(f'  Folder  : {GDRIVE_FOLDER_ID}')
-    log(f'  Method 0: mega.py (Mega URLs — bypasses Azure block)')
+    log(f'  Method 0: mega.py (Mega URLs)')
     log(f'  Method 1: aria2c 16 connections, 1MB splits')
     log(f'  Method 2: yt-dlp + curl_cffi (Cloudflare bypass)')
     log(f'  Method 3: curl_cffi browser TLS')
     log(f'  Method 4: requests stream')
     log(f'  Upload  : OAuth resumable API, 256MB chunks')
+    log(f'  WARP    : auto-activates if all direct methods fail')
     log('=' * 65)
 
     for key in ('GDRIVE_CLIENT_ID', 'GDRIVE_CLIENT_SECRET', 'GDRIVE_REFRESH_TOKEN'):
