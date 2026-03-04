@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-GDrive Downloader — GitHub Actions (SOCKS5 Proxy Optimized)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GDrive Downloader — GitHub Actions (Forced Filenames + SOCKS5 Proxy)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import os, sys, re, time, json, subprocess, tempfile
 from pathlib import Path
 from urllib.parse import urlparse, unquote
-
 import requests as req_lib
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -122,7 +121,7 @@ def file_exists(drive, folder_id, fname, expected_size) -> bool:
 # ══════════════════════════════════════════════════════════════════
 # RESOLVER
 # ══════════════════════════════════════════════════════════════════
-def resolve_url(url: str):
+def resolve_url(url: str, forced_fname: str = None):
     log('  Resolving...')
     r = None
     for method in ('HEAD', 'GET'):
@@ -137,15 +136,19 @@ def resolve_url(url: str):
             if method == 'GET':
                 log(f'  Resolve failed: {e} — using original URL')
                 path  = unquote(urlparse(url).path)
-                fname = sanitize(Path(path).name or f'file_{int(time.time())}')
+                fname = sanitize(forced_fname) if forced_fname else sanitize(Path(path).name or f'file_{int(time.time())}')
                 return url, fname, 0
 
     final = r.url if r else url
-    cd    = r.headers.get('Content-Disposition', '') if r else ''
-    m     = re.findall(r"filename\*?=['\"]?(?:UTF-8'')?([^'\";\r\n]+)", cd, re.I)
-    fname = sanitize(unquote(m[-1].strip())) if m else sanitize(
-            Path(unquote(urlparse(final).path)).name or f'file_{int(time.time())}')
     size  = int(r.headers.get('Content-Length', 0)) if r else 0
+    
+    if forced_fname:
+        fname = sanitize(forced_fname)
+    else:
+        cd    = r.headers.get('Content-Disposition', '') if r else ''
+        m     = re.findall(r"filename\*?=['\"]?(?:UTF-8'')?([^'\";\r\n]+)", cd, re.I)
+        fname = sanitize(unquote(m[-1].strip())) if m else sanitize(
+                Path(unquote(urlparse(final).path)).name or f'file_{int(time.time())}')
 
     log(f'  File : {fname}')
     log(f'  Size : {fmt(size) if size else "unknown"}')
@@ -370,18 +373,45 @@ def try_requests(url, fname, size, uploader, use_proxy=False) -> bool:
 # ════════════════════════════════════════════════════════════════
 # ORCHESTRATOR
 # ════════════════════════════════════════════════════════════════
-def process(url: str, drive, folder_id: str):
-    url = clean_url(url.strip())
-    if not url or url.startswith('#'): return
-    hr()
-    log(f'URL: {url[:90]}')
-    try:
-        final_url, fname, size = resolve_url(url)
-        if file_exists(drive, folder_id, fname, size):
+def main():
+    raw = os.environ.get('DOWNLOAD_URLS', '').strip()
+    if not raw: sys.exit(1)
+    
+    parsed_items = []
+    for line in re.split(r'[,\n]+', raw):
+        line = line.strip()
+        if not line or line.startswith('#'): continue
+        if '|' in line:
+            fname, url = line.split('|', 1)
+            parsed_items.append((clean_url(url.strip()), fname.strip()))
+        else:
+            parsed_items.append((clean_url(line), None))
+
+    if not parsed_items: sys.exit(1)
+
+    log('=' * 65)
+    log(f'  GDrive Downloader')
+    if SUBFOLDER_NAME:
+        log(f'  Target Subfolder: {SUBFOLDER_NAME}')
+    log('=' * 65)
+
+    drive = get_drive()
+    target_folder_id = GDRIVE_FOLDER_ID
+    if SUBFOLDER_NAME:
+        target_folder_id = get_or_create_subfolder(drive, GDRIVE_FOLDER_ID, SUBFOLDER_NAME)
+
+    t0 = time.time()
+    for i, (url, forced_fname) in enumerate(parsed_items, 1):
+        log(f'\n[{i}/{len(parsed_items)}]')
+        
+        final_url, fname, size = resolve_url(url, forced_fname)
+        
+        if file_exists(drive, target_folder_id, fname, size):
             log('  Already on GDrive — skipping')
-            return
-        uploader = StreamUploader(folder_id, fname, size)
-        t0       = time.time()
+            continue
+            
+        uploader = StreamUploader(target_folder_id, fname, size)
+        t_start = time.time()
         
         direct_methods = [try_aria2c, try_ytdlp, try_curl_cffi, try_curl, try_requests]
         proxy_methods  = [try_ytdlp, try_curl, try_curl_cffi, try_requests]
@@ -392,47 +422,27 @@ def process(url: str, drive, folder_id: str):
                 except: pass
 
         log('  Round 1: Testing direct connection...')
+        success = False
         for fn in direct_methods:
             _clean()
             if fn(final_url, fname, size, uploader, use_proxy=False):
-                log(f'  Done in {(time.time()-t0)/60:.1f} min')
-                return
+                log(f'  Done in {(time.time()-t_start)/60:.1f} min')
+                success = True
+                break
 
-        log('\n  ⚠️ All direct methods failed. Azure IP likely blocked (403).')
-        log('  Round 2: Retrying download via local WARP SOCKS5 Proxy...')
-        for fn in proxy_methods:
-            _clean()
-            if fn(final_url, fname, size, uploader, use_proxy=True):
-                log(f'  Done in {(time.time()-t0)/60:.1f} min')
-                return
+        if not success:
+            log('\n  ⚠️ All direct methods failed. Azure IP likely blocked (403).')
+            log('  Round 2: Retrying download via local WARP SOCKS5 Proxy...')
+            for fn in proxy_methods:
+                _clean()
+                if fn(final_url, fname, size, uploader, use_proxy=True):
+                    log(f'  Done in {(time.time()-t_start)/60:.1f} min')
+                    success = True
+                    break
 
-        log(f'\n  ❌ FAILED — all methods exhausted for: {fname}')
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        log(f'  Fatal: {e}')
-
-def main():
-    raw = os.environ.get('DOWNLOAD_URLS', '').strip()
-    if not raw: sys.exit(1)
-    urls = [clean_url(u.strip()) for u in re.split(r'[,\n]+', raw) if u.strip() and not u.strip().startswith('#')]
-    if not urls: sys.exit(1)
-
-    log('=' * 65)
-    log(f'  GDrive Downloader')
-    if SUBFOLDER_NAME:
-        log(f'  Target Subfolder: {SUBFOLDER_NAME}')
-    log('=' * 65)
-
-    drive = get_drive()
-    
-    target_folder_id = GDRIVE_FOLDER_ID
-    if SUBFOLDER_NAME:
-        target_folder_id = get_or_create_subfolder(drive, GDRIVE_FOLDER_ID, SUBFOLDER_NAME)
-
-    t0 = time.time()
-    for i, url in enumerate(urls, 1):
-        log(f'\n[{i}/{len(urls)}]')
-        process(url, drive, target_folder_id)
+        if not success:
+            log(f'\n  ❌ FAILED — all methods exhausted for: {fname}')
+            
     hr()
     log(f'All done in {(time.time()-t0)/60:.1f} min')
 
