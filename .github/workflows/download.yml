@@ -19,12 +19,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install tools & Configure WARP Proxy
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2 curl
 
-          # Cloudflare WARP — fallback VPN when direct downloads are blocked
+          # Install Cloudflare WARP
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
             | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] \
@@ -33,7 +33,17 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq cloudflare-warp
           sudo systemctl start warp-svc
+          sleep 2
 
+          # ✨ MAGIC STEP: Configure WARP as a localized SOCKS5 proxy ONLY ✨
+          # We use || fallbacks because Cloudflare occasionally updates their CLI syntax
+          warp-cli --accept-tos registration new || warp-cli --accept-tos register
+          warp-cli --accept-tos mode proxy || warp-cli --accept-tos set-mode proxy
+          warp-cli --accept-tos connect
+          sleep 3
+          warp-cli --accept-tos status
+
+          # Install Python dependencies
           pip install -q \
             yt-dlp \
             curl_cffi \
