@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GDrive Downloader — GitHub Actions
+GDrive Downloader — GitHub Actions (SOCKS5 Proxy Optimized)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Download waterfall:
   0. mega.py    — for mega.nz / mega.co.nz / userstorage.mega URLs
@@ -10,6 +10,7 @@ Download waterfall:
   4. requests   — plain fallback
 
 Upload: OAuth resumable Drive API, 256MB chunks, no rclone
+Proxy:  Strictly scopes WARP to downloads only; uploads remain native.
 """
 
 import os, sys, re, time, json, subprocess, tempfile
@@ -30,6 +31,7 @@ UPLOAD_CHUNK = 256 * 1024 * 1024   # 256MB per PUT — sweet spot for Drive API
 DL_CHUNK     = 16  * 1024 * 1024   # 16MB read buffer
 ARIA2C_CONNS = 16
 TMP          = tempfile.mkdtemp(prefix='dl_')
+PROXY_URL    = "socks5://127.0.0.1:40000"
 
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
       'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -202,7 +204,6 @@ class StreamUploader:
                 time.sleep(wait)
 
     def run_file(self, path: str):
-        """Upload from disk — 256MB direct reads, no intermediate buffer."""
         self.total_size = os.path.getsize(path)
         self._start()
         uploaded = 0; t0 = time.time(); last_log = 0
@@ -229,7 +230,7 @@ def upload_file(path: str, uploader: StreamUploader):
     uploader.run_file(path)
 
 # ══════════════════════════════════════════════════════════════════
-# PROGRESS POLLER — logs every 8s while subprocess runs
+# PROGRESS POLLER
 # ══════════════════════════════════════════════════════════════════
 def poll_bar(proc, out_path, size, desc):
     t0 = time.time(); prev = 0; last_log = 0
@@ -253,35 +254,31 @@ def poll_bar(proc, out_path, size, desc):
         pass
 
 # ══════════════════════════════════════════════════════════════════
-# METHOD 0 — mega.py (ALL Mega URLs)
-#
-# Mega's CDN (userstorage.mega.co.nz) blocks Azure/datacenter IPs
-# on plain HTTP — every method gets 403. mega.py works because it
-# talks to Mega's API (g.api.mega.co.nz) which is not IP-restricted,
-# gets a fresh temp download token + encryption key, then downloads
-# from a different CDN slot. Decryption is done client-side.
-# Works for: mega.nz/#!xxx share links AND raw userstorage CDN URLs.
+# DOWNLOAD METHODS
 # ══════════════════════════════════════════════════════════════════
 def is_mega_url(url: str) -> bool:
     host = urlparse(url).netloc.lower()
     return any(x in host for x in ('mega.nz', 'mega.co.nz', 'mega.io'))
 
-def try_mega(url, fname, size, uploader) -> bool:
+def try_mega(url, fname, size, uploader, use_proxy=False) -> bool:
     log('  [0] mega.py — Mega encrypted API download')
     try:
         from mega import Mega
     except ImportError:
-        log('  mega.py not installed — skipping (add "mega.py" to pip install in workflow)')
+        log('  mega.py not installed — skipping')
         return False
+
+    # Force the proxy through environment variables for mega.py if needed
+    if use_proxy:
+        os.environ['HTTP_PROXY']  = PROXY_URL
+        os.environ['HTTPS_PROXY'] = PROXY_URL
 
     try:
         m = Mega()
-        m.login()  # anonymous — no account needed for public links
+        m.login()
         log('  Mega anonymous login OK')
-        log(f'  Downloading via Mega API...')
+        log(f'  Downloading via Mega API {"(via WARP Proxy)" if use_proxy else ""}...')
         t0 = time.time()
-
-        # download_url returns the local path where the file was saved
         out_path = m.download_url(url, dest_path=TMP, dest_filename=None)
 
         if not out_path or not Path(str(out_path)).exists():
@@ -302,12 +299,13 @@ def try_mega(url, fname, size, uploader) -> bool:
     except Exception as e:
         log(f'  mega.py failed: {e}')
         return False
+    finally:
+        if use_proxy:
+            os.environ.pop('HTTP_PROXY', None)
+            os.environ.pop('HTTPS_PROXY', None)
 
-# ══════════════════════════════════════════════════════════════════
-# METHOD 1 — aria2c (fastest for open/CDN servers)
-# ══════════════════════════════════════════════════════════════════
-def try_aria2c(url, fname, size, uploader) -> bool:
-    log('  [1/4] aria2c — 16 connections, 1MB splits')
+def try_aria2c(url, fname, size, uploader, use_proxy=False) -> bool:
+    log(f'  [1/4] aria2c — 16 connections{" (via WARP Proxy)" if use_proxy else ""}')
     out = f'{TMP}/{fname}'
     cmd = [
         'aria2c', url, '--dir', TMP, '--out', fname,
@@ -324,6 +322,9 @@ def try_aria2c(url, fname, size, uploader) -> bool:
         '--header=Accept-Language: en-US,en;q=0.9',
         f'--header=Referer: {referer(url)}',
     ]
+    if use_proxy:
+        cmd.append(f'--all-proxy={PROXY_URL}')
+
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     poll_bar(proc, out, size, 'aria2c')
     proc.wait()
@@ -337,11 +338,8 @@ def try_aria2c(url, fname, size, uploader) -> bool:
     except: pass
     return True
 
-# ══════════════════════════════════════════════════════════════════
-# METHOD 2 — yt-dlp + curl_cffi (Cloudflare bypass)
-# ══════════════════════════════════════════════════════════════════
-def try_ytdlp(url, fname, size, uploader) -> bool:
-    log('  [2/4] yt-dlp + curl_cffi (Cloudflare impersonation)')
+def try_ytdlp(url, fname, size, uploader, use_proxy=False) -> bool:
+    log(f'  [2/4] yt-dlp + curl_cffi{" (via WARP Proxy)" if use_proxy else ""}')
     stem     = Path(fname).stem
     out_tmpl = f'{TMP}/{stem}.%(ext)s'
     cmd = [
@@ -356,14 +354,16 @@ def try_ytdlp(url, fname, size, uploader) -> bool:
         '--no-check-certificate',
         '--extractor-args', 'generic:impersonate',
         '--progress', '--newline',
-        url
     ]
+    if use_proxy:
+        cmd.extend(['--proxy', PROXY_URL])
+    cmd.append(url)
+
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, bufsize=1)
     for line in proc.stdout:
         line = line.strip()
-        if line:
-            log(f'  {line}')
+        if line: log(f'  {line}')
     proc.wait()
     candidates = sorted(Path(TMP).glob(f'{stem}.*'),
                         key=lambda p: p.stat().st_size, reverse=True)
@@ -378,11 +378,8 @@ def try_ytdlp(url, fname, size, uploader) -> bool:
     except: pass
     return True
 
-# ══════════════════════════════════════════════════════════════════
-# METHOD 3 — curl_cffi (browser TLS fingerprint)
-# ══════════════════════════════════════════════════════════════════
-def try_curl_cffi(url, fname, size, uploader) -> bool:
-    log('  [3/4] curl_cffi (browser TLS fingerprint)')
+def try_curl_cffi(url, fname, size, uploader, use_proxy=False) -> bool:
+    log(f'  [3/4] curl_cffi TLS print{" (via WARP Proxy)" if use_proxy else ""}')
     try:
         from curl_cffi import requests as cffi_req
     except ImportError:
@@ -392,9 +389,12 @@ def try_curl_cffi(url, fname, size, uploader) -> bool:
     out  = f'{TMP}/{fname}'
     part = out + '.part'
     t0 = time.time(); done = 0; last_log = 0
+    px = {"http": PROXY_URL, "https": PROXY_URL} if use_proxy else None
+
     try:
         r = cffi_req.get(url, stream=True, timeout=120,
-                         impersonate='chrome120', headers=COMMON_HEADERS)
+                         impersonate='chrome120', headers=COMMON_HEADERS,
+                         proxies=px)
         r.raise_for_status()
         with open(part, 'wb') as f:
             for chunk in r.iter_content(chunk_size=DL_CHUNK):
@@ -420,16 +420,15 @@ def try_curl_cffi(url, fname, size, uploader) -> bool:
     except: pass
     return True
 
-# ══════════════════════════════════════════════════════════════════
-# METHOD 4 — requests stream (last resort)
-# ══════════════════════════════════════════════════════════════════
-def try_requests(url, fname, size, uploader) -> bool:
-    log('  [4/4] requests stream (plain fallback)')
+def try_requests(url, fname, size, uploader, use_proxy=False) -> bool:
+    log(f'  [4/4] requests stream{" (via WARP Proxy)" if use_proxy else ""}')
     out  = f'{TMP}/{fname}'
     part = out + '.part'
     t0 = time.time(); done = 0; last_log = 0
+    px = {"http": PROXY_URL, "https": PROXY_URL} if use_proxy else None
+
     try:
-        with SESSION.get(url, stream=True, timeout=120) as r:
+        with SESSION.get(url, stream=True, timeout=120, proxies=px) as r:
             r.raise_for_status()
             with open(part, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=DL_CHUNK):
@@ -454,61 +453,6 @@ def try_requests(url, fname, size, uploader) -> bool:
     try: os.remove(out)
     except: pass
     return True
-
-# ════════════════════════════════════════════════════════════════
-# WARP VPN — Cloudflare WARP tunnel
-# Only activated after all direct methods fail.
-# Gives a Cloudflare IP which bypasses many datacenter/Azure blocks.
-# ════════════════════════════════════════════════════════════════
-_warp_connected = False
-
-def warp_available() -> bool:
-    try:
-        r = subprocess.run(['warp-cli', '--version'],
-                           capture_output=True, timeout=5)
-        return r.returncode == 0
-    except Exception:
-        return False
-
-def warp_connect() -> bool:
-    global _warp_connected
-    if _warp_connected:
-        return True
-    if not warp_available():
-        log('  WARP: warp-cli not found — skipping')
-        return False
-    try:
-        log('  WARP: registering...')
-        subprocess.run(['warp-cli', '--accept-tos', 'registration', 'new'],
-                       capture_output=True, timeout=30)
-        log('  WARP: connecting...')
-        subprocess.run(['warp-cli', '--accept-tos', 'connect'],
-                       capture_output=True, timeout=30)
-        for _ in range(15):
-            time.sleep(1)
-            r = subprocess.run(['warp-cli', 'status'],
-                               capture_output=True, text=True, timeout=5)
-            if 'Connected' in r.stdout:
-                log('  WARP: connected ✓')
-                _warp_connected = True
-                return True
-        log('  WARP: timed out waiting for connection')
-        return False
-    except Exception as e:
-        log(f'  WARP: connect failed: {e}')
-        return False
-
-def warp_disconnect():
-    global _warp_connected
-    if not _warp_connected:
-        return
-    try:
-        subprocess.run(['warp-cli', 'disconnect'],
-                       capture_output=True, timeout=10)
-        _warp_connected = False
-        log('  WARP: disconnected')
-    except Exception:
-        pass
 
 # ════════════════════════════════════════════════════════════════
 # ORCHESTRATOR
@@ -537,31 +481,28 @@ def process(url: str, drive, folder_id: str):
                 try: p.unlink()
                 except: pass
 
-        # Round 1: direct connection
-        log('  Round 1: direct')
+        # Round 1: native fast connection
+        log('  Round 1: direct connection')
         for fn in methods:
             _clean()
             try:
-                if fn(final_url, fname, size, uploader):
+                if fn(final_url, fname, size, uploader, use_proxy=False):
                     log(f'  Done in {(time.time()-t0)/60:.1f} min')
                     return
             except Exception as e:
                 log(f'  Error in {fn.__name__}: {e}')
 
-        # Round 2: via WARP (only if all direct attempts failed)
-        log('  All direct methods failed — activating WARP...')
-        if warp_connect():
-            log('  Round 2: retrying via WARP tunnel')
-            for fn in methods:
-                _clean()
-                try:
-                    if fn(final_url, fname, size, uploader):
-                        warp_disconnect()
-                        log(f'  Done in {(time.time()-t0)/60:.1f} min')
-                        return
-                except Exception as e:
-                    log(f'  Error in {fn.__name__} (WARP): {e}')
-            warp_disconnect()
+        # Round 2: via SOCKS5 Proxy (Upload remains native)
+        log('  All direct methods failed — activating local WARP SOCKS5 Proxy...')
+        log('  Round 2: retrying via proxy (Uploads will remain on fast direct IP)')
+        for fn in methods:
+            _clean()
+            try:
+                if fn(final_url, fname, size, uploader, use_proxy=True):
+                    log(f'  Done in {(time.time()-t0)/60:.1f} min')
+                    return
+            except Exception as e:
+                log(f'  Error in {fn.__name__} (Proxy): {e}')
 
         log(f'  FAILED — all methods exhausted for: {fname}')
     except Exception as e:
@@ -591,7 +532,7 @@ def main():
     log(f'  Method 3: curl_cffi browser TLS')
     log(f'  Method 4: requests stream')
     log(f'  Upload  : OAuth resumable API, 256MB chunks')
-    log(f'  WARP    : auto-activates if all direct methods fail')
+    log(f'  WARP    : auto-routes download traffic via local SOCKS5 if needed')
     log('=' * 65)
 
     for key in ('GDRIVE_CLIENT_ID', 'GDRIVE_CLIENT_SECRET', 'GDRIVE_REFRESH_TOKEN'):
