@@ -2,22 +2,6 @@
 """
 GDrive Downloader — GitHub Actions (SOCKS5 Proxy Optimized)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Download waterfall:
-  Round 1 (Direct): 
-    1. aria2c     — 16 connections, 1MB splits (fastest for open CDNs)
-    2. yt-dlp     — curl_cffi impersonation, bypasses Cloudflare
-    3. curl_cffi  — browser TLS fingerprint
-    4. curl       — native binary fallback
-    5. requests   — plain fallback
-
-  Round 2 (WARP Proxy - activated only on 403 Forbidden):
-    1. yt-dlp     — 16 concurrent fragments through SOCKS5
-    2. curl       — native SOCKS5 fallback
-    3. curl_cffi  — SOCKS5 TLS fingerprint
-    4. requests   — plain SOCKS5 fallback
-    (aria2c is skipped because it lacks SOCKS5 support)
-
-Upload: OAuth resumable Drive API, 256MB chunks, native Azure IP (No Proxy)
 """
 
 import os, sys, re, time, json, subprocess, tempfile
@@ -33,6 +17,7 @@ from googleapiclient.discovery import build
 # CONFIG
 # ══════════════════════════════════════════════════════════════════
 GDRIVE_FOLDER_ID = '1TRND8VlWi0U7wdHk3HLJ7hvzOw90PDE3'
+SUBFOLDER_NAME   = os.environ.get('FOLDER_NAME', '').strip()
 
 UPLOAD_CHUNK = 256 * 1024 * 1024   
 DL_CHUNK     = 16  * 1024 * 1024   
@@ -51,9 +36,6 @@ COMMON_HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9',
 }
 
-# ══════════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════════
 def log(msg): print(msg, flush=True)
 def hr():     log('─' * 65)
 def fmt(b):   return f'{b/1e9:.2f} GB' if b > 1e9 else f'{b/1e6:.1f} MB'
@@ -81,7 +63,7 @@ def make_session():
 SESSION = make_session()
 
 # ══════════════════════════════════════════════════════════════════
-# OAUTH & DRIVE
+# OAUTH & FOLDER LOGIC
 # ══════════════════════════════════════════════════════════════════
 _creds = None
 def get_creds() -> Credentials:
@@ -108,8 +90,27 @@ def get_token() -> str:
 def get_drive():
     return build('drive', 'v3', credentials=get_creds(), cache_discovery=False)
 
+def get_or_create_subfolder(drive, parent_id, folder_name):
+    log(f"  Checking/Creating Subfolder: '{folder_name}'...")
+    safe_name = folder_name.replace("'", "\\'")
+    q = f"name='{safe_name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    res = drive.files().list(q=q, fields='files(id,name)', supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+    if res.get('files'):
+        log(f"  Subfolder exists -> {res['files'][0]['id']}")
+        return res['files'][0]['id']
+    
+    meta = {
+        'name': folder_name,
+        'parents': [parent_id],
+        'mimeType': 'application/vnd.google-apps.folder'
+    }
+    folder = drive.files().create(body=meta, fields='id', supportsAllDrives=True).execute()
+    log(f"  Created new subfolder -> {folder['id']}")
+    return folder['id']
+
 def file_exists(drive, folder_id, fname, expected_size) -> bool:
-    q = f"name='{fname}' and '{folder_id}' in parents and trashed=false"
+    safe_fname = fname.replace("'", "\\'")
+    q = f"name='{safe_fname}' and '{folder_id}' in parents and trashed=false"
     res = drive.files().list(
         q=q, fields='files(id,size)',
         supportsAllDrives=True, includeItemsFromAllDrives=True
@@ -152,7 +153,7 @@ def resolve_url(url: str):
     return final, fname, size
 
 # ══════════════════════════════════════════════════════════════════
-# UPLOADER (Strictly runs on native IP, ignores proxies)
+# UPLOADER
 # ══════════════════════════════════════════════════════════════════
 class StreamUploader:
     def __init__(self, folder_id, fname, total_size):
@@ -240,10 +241,7 @@ def poll_bar(proc, out_path, size, desc):
 # DOWNLOADERS
 # ══════════════════════════════════════════════════════════════════
 def try_aria2c(url, fname, size, uploader, use_proxy=False) -> bool:
-    if use_proxy:
-        log('  [X] aria2c — Skipped (Does not support SOCKS5)')
-        return False
-        
+    if use_proxy: return False
     log('  [~] aria2c — 16 connections')
     out = f'{TMP}/{fname}'
     cmd = [
@@ -255,16 +253,13 @@ def try_aria2c(url, fname, size, uploader, use_proxy=False) -> bool:
         '--continue=true', '--auto-file-renaming=false',
         '--file-allocation=none', '--quiet=true',
         '--allow-overwrite=true',
-        f'--user-agent={UA}',
-        '--header=Accept: */*',
-        '--header=Accept-Encoding: identity',
-        f'--header=Referer: {referer(url)}',
+        f'--user-agent={UA}', '--header=Accept: */*',
+        '--header=Accept-Encoding: identity', f'--header=Referer: {referer(url)}',
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     poll_bar(proc, out, size, 'aria2c')
     proc.wait()
-    if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 10000:
-        return False
+    if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 10000: return False
     upload_file(out, uploader)
     try: os.remove(out)
     except: pass
@@ -330,11 +325,8 @@ def try_curl(url, fname, size, uploader, use_proxy=False) -> bool:
     log(f'  [~] curl binary fallback{" (via WARP SOCKS5 Proxy)" if use_proxy else ""}')
     out = f'{TMP}/{fname}'
     cmd = [
-        'curl', '-L', '-o', out,
-        '-A', UA,
-        '-H', f'Referer: {referer(url)}',
-        '--retry', '5', '--retry-connrefused',
-        '--connect-timeout', '20'
+        'curl', '-L', '-o', out, '-A', UA, '-H', f'Referer: {referer(url)}',
+        '--retry', '5', '--retry-connrefused', '--connect-timeout', '20'
     ]
     if use_proxy: cmd.extend(['-x', PROXY_URL])
     cmd.append(url)
@@ -342,8 +334,7 @@ def try_curl(url, fname, size, uploader, use_proxy=False) -> bool:
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     poll_bar(proc, out, size, 'curl')
     proc.wait()
-    if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 10000:
-        return False
+    if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 10000: return False
     upload_file(out, uploader)
     try: os.remove(out)
     except: pass
@@ -392,10 +383,7 @@ def process(url: str, drive, folder_id: str):
         uploader = StreamUploader(folder_id, fname, size)
         t0       = time.time()
         
-        # Round 1: Fast Direct Array (aria2c primary)
         direct_methods = [try_aria2c, try_ytdlp, try_curl_cffi, try_curl, try_requests]
-        
-        # Round 2: Proxy Array (yt-dlp primary for parallel chunking. aria2c skipped)
         proxy_methods  = [try_ytdlp, try_curl, try_curl_cffi, try_requests]
 
         def _clean():
@@ -412,7 +400,6 @@ def process(url: str, drive, folder_id: str):
 
         log('\n  ⚠️ All direct methods failed. Azure IP likely blocked (403).')
         log('  Round 2: Retrying download via local WARP SOCKS5 Proxy...')
-        log('  (Uploads will continue to use the fast native connection)')
         for fn in proxy_methods:
             _clean()
             if fn(final_url, fname, size, uploader, use_proxy=True):
@@ -432,13 +419,20 @@ def main():
 
     log('=' * 65)
     log(f'  GDrive Downloader')
+    if SUBFOLDER_NAME:
+        log(f'  Target Subfolder: {SUBFOLDER_NAME}')
     log('=' * 65)
 
     drive = get_drive()
+    
+    target_folder_id = GDRIVE_FOLDER_ID
+    if SUBFOLDER_NAME:
+        target_folder_id = get_or_create_subfolder(drive, GDRIVE_FOLDER_ID, SUBFOLDER_NAME)
+
     t0 = time.time()
     for i, url in enumerate(urls, 1):
         log(f'\n[{i}/{len(urls)}]')
-        process(url, drive, GDRIVE_FOLDER_ID)
+        process(url, drive, target_folder_id)
     hr()
     log(f'All done in {(time.time()-t0)/60:.1f} min')
 
